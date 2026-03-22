@@ -1,5 +1,4 @@
-use example::mock_discovery::MockDiscoveryMap;
-use iroh::EndpointId;
+use iroh::{Endpoint, EndpointId, endpoint::presets::N0};
 use iroh_h3_client::IrohH3Client;
 use wasm_bindgen_test::wasm_bindgen_test;
 wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
@@ -10,8 +9,7 @@ const ALPN: &[u8] = b"iroh+h3";
 #[cfg_attr(not(target_family = "wasm"), tokio::test)]
 #[wasm_bindgen_test]
 async fn error_handling_unresolvable_peer() {
-    let discovery = MockDiscoveryMap::new();
-    let endpoint = discovery.spawn_endpoint().await;
+    let endpoint = Endpoint::bind(N0).await.unwrap();
 
     let client = IrohH3Client::new(endpoint, ALPN.into());
 
