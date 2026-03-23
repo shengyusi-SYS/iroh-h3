@@ -1,20 +1,20 @@
-use std::time::Instant;
-
-use example::mock_discovery::MockDiscoveryMap;
+use iroh::{Endpoint, endpoint::presets::N0};
 use iroh_h3_axum::IrohAxum;
 use iroh_h3_client::IrohH3Client;
-use tokio::task::JoinSet;
+use n0_future::{task::JoinSet, time::Instant};
 
 use axum::{Router, routing::post};
+use wasm_bindgen_test::wasm_bindgen_test;
+wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 
 const ALPN: &[u8] = b"iroh+h3";
 
 /// Connection reuse / many requests
-#[tokio::test]
+#[cfg_attr(not(target_family = "wasm"), tokio::test)]
+#[wasm_bindgen_test]
 async fn many_requests_connection_reuse() {
-    let discovery = MockDiscoveryMap::new();
-    let endpoint_1 = discovery.spawn_endpoint().await;
-    let endpoint_2 = discovery.spawn_endpoint().await;
+    let endpoint_1 = Endpoint::bind(N0).await.unwrap();
+    let endpoint_2 = Endpoint::bind(N0).await.unwrap();
     endpoint_1.online().await;
     endpoint_2.online().await;
 

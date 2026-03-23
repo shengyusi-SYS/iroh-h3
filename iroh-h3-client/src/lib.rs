@@ -61,11 +61,11 @@ use crate::request::RequestBuilder;
 /// ```rust
 /// use bytes::Bytes;
 /// use http::Request;
-/// use iroh::{Endpoint, EndpointId};
+/// use iroh::{Endpoint, EndpointId, endpoint::presets::N0};
 /// use iroh_h3_client::IrohH3Client;
 ///
 /// # async fn example(peer_id: EndpointId) -> Result<(), Box<dyn std::error::Error>> {
-/// let endpoint = Endpoint::bind().await?;
+/// let endpoint = Endpoint::bind(N0).await?;
 /// let client = IrohH3Client::new(endpoint, b"h3".to_vec());
 ///
 /// let url = format!("iroh+h3://{peer_id}/hello");

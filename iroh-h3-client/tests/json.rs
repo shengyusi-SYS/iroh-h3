@@ -1,9 +1,13 @@
+#![cfg(feature = "json")]
+
 use axum::{Json, Router, response::IntoResponse, routing::post};
-use example::mock_discovery::MockDiscoveryMap;
+use iroh::{Endpoint, endpoint::presets::N0};
 use iroh_h3_axum::IrohAxum;
 use iroh_h3_client::IrohH3Client;
 
 use serde::{Deserialize, Serialize};
+use wasm_bindgen_test::wasm_bindgen_test;
+wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 
 const ALPN: &[u8] = b"iroh+h3";
 
@@ -15,11 +19,11 @@ struct Message {
 const PING: &str = "Ping!";
 const PONG: &str = "Pong!";
 
-#[tokio::test]
+#[cfg_attr(not(target_family = "wasm"), tokio::test)]
+#[wasm_bindgen_test]
 async fn json_request_response() {
-    let discovery = MockDiscoveryMap::new();
-    let endpoint_1 = discovery.spawn_endpoint().await;
-    let endpoint_2 = discovery.spawn_endpoint().await;
+    let endpoint_1 = Endpoint::bind(N0).await.unwrap();
+    let endpoint_2 = Endpoint::bind(N0).await.unwrap();
     endpoint_1.online().await;
     endpoint_2.online().await;
 

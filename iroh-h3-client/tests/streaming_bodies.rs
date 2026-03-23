@@ -1,28 +1,29 @@
 use std::convert::Infallible;
 
-use bytes::Bytes;
-use example::mock_discovery::MockDiscoveryMap;
-use futures::StreamExt;
-use http_body::Frame;
-use http_body_util::{StreamBody, combinators::BoxBody};
-use iroh_h3_axum::IrohAxum;
-use iroh_h3_client::IrohH3Client;
-
 use axum::{
     Router,
     body::Body,
     response::IntoResponse,
     routing::{get, post},
 };
+use bytes::Bytes;
+use futures::StreamExt;
+use http_body::Frame;
+use http_body_util::{StreamBody, combinators::BoxBody};
+use iroh::{Endpoint, endpoint::presets::N0};
+use iroh_h3_axum::IrohAxum;
+use iroh_h3_client::IrohH3Client;
+use wasm_bindgen_test::wasm_bindgen_test;
+wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 
 const ALPN: &[u8] = b"iroh+h3";
 
 /// Streaming responses
-#[tokio::test]
+#[cfg_attr(not(target_family = "wasm"), tokio::test)]
+#[wasm_bindgen_test]
 async fn streaming_response() {
-    let discovery = MockDiscoveryMap::new();
-    let endpoint_1 = discovery.spawn_endpoint().await;
-    let endpoint_2 = discovery.spawn_endpoint().await;
+    let endpoint_1 = Endpoint::bind(N0).await.unwrap();
+    let endpoint_2 = Endpoint::bind(N0).await.unwrap();
     endpoint_1.online().await;
     endpoint_2.online().await;
 
@@ -51,11 +52,11 @@ async fn streaming_response() {
 }
 
 /// Streaming request body
-#[tokio::test]
+#[cfg_attr(not(target_family = "wasm"), tokio::test)]
+#[wasm_bindgen_test]
 async fn streaming_request_body() {
-    let discovery = MockDiscoveryMap::new();
-    let endpoint_1 = discovery.spawn_endpoint().await;
-    let endpoint_2 = discovery.spawn_endpoint().await;
+    let endpoint_1 = Endpoint::bind(N0).await.unwrap();
+    let endpoint_2 = Endpoint::bind(N0).await.unwrap();
     endpoint_1.online().await;
     endpoint_2.online().await;
 
