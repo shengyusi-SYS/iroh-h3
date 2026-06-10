@@ -433,8 +433,7 @@ impl quic::RecvStream for RecvStream {
 
         let (stream, chunk) = ready!(self.read_chunk_fut.poll(cx));
         self.stream = Some(stream);
-        Poll::Ready(Ok(chunk
-            .map_err(convert_read_error_to_stream_error)?))
+        Poll::Ready(Ok(chunk.map_err(convert_read_error_to_stream_error)?))
     }
 
     /// Cancels further reception on this stream with the given error code.
