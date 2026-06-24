@@ -25,6 +25,7 @@
 #![warn(missing_docs)]
 
 mod body;
+mod cancel;
 mod connection_manager;
 pub mod error;
 pub mod middleware;
@@ -39,6 +40,7 @@ pub use http::{Method, Request, Response, Uri};
 use iroh::Endpoint;
 
 pub use crate::body::Body;
+pub use crate::cancel::{CancellableBytesStream, PendingRequest, RequestCancelHandle};
 use crate::connection_manager::ConnectionManager;
 use crate::error::Error;
 use crate::middleware::{Middleware, Pipeline, Service};
