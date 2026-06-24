@@ -6,6 +6,9 @@ use http_body_util::{StreamBody, combinators::BoxBody};
 use iroh::{Endpoint, endpoint::presets::N0};
 use iroh_h3_axum::IrohAxum;
 use iroh_h3_client::{IrohH3Client, error::Error};
+use std::future::Future;
+use std::sync::{Arc, Mutex};
+use std::task::Poll;
 use wasm_bindgen_test::wasm_bindgen_test;
 
 wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
@@ -85,21 +88,51 @@ async fn headers_pending_cancel_stops_waiting() {
     endpoint_1.online().await;
     endpoint_2.online().await;
 
-    async fn delayed_headers() -> &'static str {
-        n0_future::time::sleep(std::time::Duration::from_millis(200)).await;
-        "late"
-    }
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let entered_tx = Arc::new(Mutex::new(Some(entered_tx)));
 
-    let app = Router::new().route("/late", get(delayed_headers));
+    let app = Router::new().route(
+        "/late",
+        get({
+            let entered_tx = entered_tx.clone();
+            move || {
+                let entered_tx = entered_tx.clone();
+                async move {
+                    if let Some(tx) = entered_tx.lock().unwrap().take() {
+                        let _ = tx.send(());
+                    }
+                    n0_future::time::sleep(std::time::Duration::from_millis(200)).await;
+                    "late"
+                }
+            }
+        }),
+    );
     let _router = iroh::protocol::Router::builder(endpoint_1.clone())
         .accept(ALPN, IrohAxum::new(app))
         .spawn();
 
     let client = IrohH3Client::new(endpoint_2, ALPN.into());
     let uri = format!("iroh+h3://{}/late", endpoint_1.id());
-    let pending = Box::pin(client.get(&uri).send_cancellable().unwrap());
+    let mut pending = Box::pin(client.get(&uri).send_cancellable().unwrap());
     let handle = pending.cancel_handle();
+    let mut entered_rx = Box::pin(entered_rx);
 
+    futures::future::poll_fn(|cx| {
+        if let Poll::Ready(result) = entered_rx.as_mut().poll(cx) {
+            result.unwrap();
+            return Poll::Ready(());
+        }
+        if let Poll::Ready(result) = pending.as_mut().poll(cx) {
+            match result {
+                Ok(_) => panic!("request completed before server entered delayed handler"),
+                Err(err) => {
+                    panic!("request failed before server entered delayed handler: {err:?}")
+                }
+            }
+        }
+        Poll::Pending
+    })
+    .await;
     handle.cancel();
 
     let result = pending.await;
