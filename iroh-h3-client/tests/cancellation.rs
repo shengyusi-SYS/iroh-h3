@@ -1,6 +1,8 @@
 use axum::{Router, body::Body as AxumBody, response::IntoResponse, routing::get};
 use bytes::Bytes;
 use futures::StreamExt;
+use http_body::Frame;
+use http_body_util::{StreamBody, combinators::BoxBody};
 use iroh::{Endpoint, endpoint::presets::N0};
 use iroh_h3_axum::IrohAxum;
 use iroh_h3_client::{IrohH3Client, error::Error};
@@ -73,6 +75,35 @@ async fn body_cancel_returns_cancelled_once() {
 
     assert!(matches!(first, Some(Err(Error::Cancelled))));
     assert!(second.is_none());
+}
+
+#[cfg_attr(not(target_family = "wasm"), tokio::test)]
+#[wasm_bindgen_test]
+async fn headers_pending_cancel_stops_waiting() {
+    let endpoint_1 = Endpoint::bind(N0).await.unwrap();
+    let endpoint_2 = Endpoint::bind(N0).await.unwrap();
+    endpoint_1.online().await;
+    endpoint_2.online().await;
+
+    async fn delayed_headers() -> &'static str {
+        n0_future::time::sleep(std::time::Duration::from_millis(200)).await;
+        "late"
+    }
+
+    let app = Router::new().route("/late", get(delayed_headers));
+    let _router = iroh::protocol::Router::builder(endpoint_1.clone())
+        .accept(ALPN, IrohAxum::new(app))
+        .spawn();
+
+    let client = IrohH3Client::new(endpoint_2, ALPN.into());
+    let uri = format!("iroh+h3://{}/late", endpoint_1.id());
+    let pending = Box::pin(client.get(&uri).send_cancellable().unwrap());
+    let handle = pending.cancel_handle();
+
+    handle.cancel();
+
+    let result = pending.await;
+    assert!(matches!(result, Err(Error::Cancelled)));
 }
 
 #[cfg_attr(not(target_family = "wasm"), tokio::test)]
@@ -185,4 +216,20 @@ async fn non_cancellable_response_returns_body_not_cancellable() {
     let result = response.cancellable_bytes_stream();
 
     assert!(matches!(result, Err(Error::BodyNotCancellable)));
+}
+
+#[cfg_attr(not(target_family = "wasm"), tokio::test)]
+#[wasm_bindgen_test]
+async fn streaming_request_body_send_cancellable_returns_request_body_not_cancellable() {
+    let endpoint = Endpoint::bind(N0).await.unwrap();
+    endpoint.online().await;
+
+    let client = IrohH3Client::new(endpoint.clone(), ALPN.into());
+    let uri = format!("iroh+h3://{}/upload", endpoint.id());
+    let stream = futures::stream::iter([Ok::<_, Error>(Frame::data(Bytes::from_static(b"x")))]);
+    let body = BoxBody::new(StreamBody::new(stream)).into();
+
+    let result = client.post(&uri).body(body).unwrap().send_cancellable();
+
+    assert!(matches!(result, Err(Error::RequestBodyNotCancellable)));
 }

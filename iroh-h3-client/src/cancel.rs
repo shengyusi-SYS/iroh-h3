@@ -753,6 +753,32 @@ mod tests {
     }
 
     #[test]
+    fn fixed_body_send_cancel_stops_request_side() {
+        let state = CancellableRequestState::new();
+        state.mark_phase(RequestPhase::SendingRequestBody);
+        RequestCancelHandle::new(state.clone()).cancel();
+
+        let mut owner = FakeStopOwner::default();
+        state.apply_cancel_to_owner(&mut owner);
+
+        assert_eq!(owner.send_stops, 1);
+        assert_eq!(owner.receive_stops, 1);
+    }
+
+    #[test]
+    fn finish_pending_cancel_stops_request_side() {
+        let state = CancellableRequestState::new();
+        state.mark_phase(RequestPhase::FinishingRequest);
+        RequestCancelHandle::new(state.clone()).cancel();
+
+        let mut owner = FakeStopOwner::default();
+        state.apply_cancel_to_owner(&mut owner);
+
+        assert_eq!(owner.send_stops, 1);
+        assert_eq!(owner.receive_stops, 1);
+    }
+
+    #[test]
     fn eof_then_drop_does_not_stop_sending() {
         let state = CancellableRequestState::new();
         state.mark_recv_terminal();
