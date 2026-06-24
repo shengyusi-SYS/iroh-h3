@@ -1,15 +1,19 @@
+use std::fmt;
 use std::marker::PhantomData;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, ready};
 
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
 use futures::task::AtomicWaker;
 use h3::error::Code;
+use http_body::Frame;
 use iroh_h3::OpenStreams;
+use tracing::{debug, instrument, trace};
 
 use crate::error::Error;
 use crate::response::Response;
 
-#[allow(dead_code)]
 pub(crate) type H3RequestStream = h3::client::RequestStream<iroh_h3::BidiStream<Bytes>, Bytes>;
 pub(crate) type H3Sender = h3::client::SendRequest<OpenStreams, Bytes>;
 
@@ -63,10 +67,8 @@ pub(crate) enum RequestPhase {
     Complete,
 }
 
-#[allow(dead_code)]
 pub(crate) const REQUEST_CANCEL_CODE: Code = Code::H3_REQUEST_CANCELLED;
 
-#[allow(dead_code)]
 pub(crate) trait StopOwner {
     fn stop_receive(&mut self);
     fn stop_send(&mut self);
@@ -191,12 +193,111 @@ impl RequestCancelHandle {
     }
 }
 
-#[allow(dead_code)]
+pub(crate) struct CancellableH3Body {
+    stream: Option<H3RequestStream>,
+    sender: H3Sender,
+    state: Arc<CancellableRequestState>,
+}
+
+impl CancellableH3Body {
+    #[allow(dead_code)]
+    pub(crate) fn new(
+        stream: H3RequestStream,
+        sender: H3Sender,
+        state: Arc<CancellableRequestState>,
+    ) -> Self {
+        state.mark_phase(RequestPhase::ReadingResponseBody);
+        state.mark_send_finished();
+        Self {
+            stream: Some(stream),
+            sender,
+            state,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn cancel_handle(&self) -> RequestCancelHandle {
+        RequestCancelHandle::new(self.state.clone())
+    }
+}
+
+impl fmt::Debug for CancellableH3Body {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let _ = &self.sender;
+        f.debug_struct("CancellableH3Body").finish_non_exhaustive()
+    }
+}
+
+impl Drop for CancellableH3Body {
+    fn drop(&mut self) {
+        let _ = &self.sender;
+        if let Some(stream) = self.stream.as_mut() {
+            let mut owner = H3StopOwner::new(stream);
+            self.state.apply_drop_cleanup_to_owner(&mut owner);
+        }
+    }
+}
+
+pub(crate) struct LegacyCompatibleH3ResponseBody {
+    body: Option<CancellableH3Body>,
+}
+
+impl LegacyCompatibleH3ResponseBody {
+    pub(crate) fn new(body: CancellableH3Body) -> Self {
+        Self { body: Some(body) }
+    }
+}
+
+type BodyStreamItem = Result<Frame<Bytes>, Error>;
+
+impl http_body::Body for LegacyCompatibleH3ResponseBody {
+    type Data = Bytes;
+    type Error = Error;
+
+    #[instrument(skip(self, cx))]
+    fn poll_frame(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<BodyStreamItem>> {
+        let Some(body) = self.body.as_mut() else {
+            return Poll::Ready(None);
+        };
+        let Some(stream) = body.stream.as_mut() else {
+            return Poll::Ready(None);
+        };
+
+        match ready!(stream.poll_recv_data(cx)).transpose() {
+            Some(Ok(mut frame)) => {
+                trace!("received a frame of {} bytes", frame.remaining());
+                let bytes = frame.copy_to_bytes(frame.remaining());
+                Poll::Ready(Some(Ok(Frame::data(bytes))))
+            }
+            Some(Err(err)) => {
+                body.state.mark_recv_terminal();
+                body.stream.take();
+                if err.is_h3_no_error() {
+                    debug!("received H3_NO_ERROR");
+                    Poll::Ready(None)
+                } else {
+                    Poll::Ready(Some(Err(Error::Transport(err.into()))))
+                }
+            }
+            None => {
+                body.state.mark_recv_terminal();
+                body.stream.take();
+                Poll::Ready(None)
+            }
+        }
+    }
+}
+
+impl Drop for LegacyCompatibleH3ResponseBody {
+    fn drop(&mut self) {
+        self.body.take();
+    }
+}
+
 pub(crate) struct H3StopOwner<'a> {
     stream: &'a mut H3RequestStream,
 }
 
-#[allow(dead_code)]
 impl<'a> H3StopOwner<'a> {
     pub(crate) fn new(stream: &'a mut H3RequestStream) -> Self {
         Self { stream }

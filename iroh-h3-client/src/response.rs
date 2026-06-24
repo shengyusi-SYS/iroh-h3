@@ -21,12 +21,12 @@ use bytes::{Buf, Bytes};
 use futures::{Stream, StreamExt};
 use http_body::Frame;
 use http_body_util::BodyExt;
-use iroh_h3::OpenStreams;
 #[cfg(feature = "json")]
 use serde::de::DeserializeOwned;
 use tracing::{debug, instrument, trace};
 
 use crate::body::Body;
+use crate::cancel::{H3RequestStream, H3Sender};
 use crate::error::Error;
 use crate::response::sse::{SseEvent, SseStream};
 
@@ -225,15 +225,12 @@ impl Response {
 ///
 /// Wraps the `RequestStream` returned by iroh-h3.
 pub(crate) struct IrohH3ResponseBody {
-    pub(crate) stream: h3::client::RequestStream<iroh_h3::BidiStream<Bytes>, Bytes>,
-    pub(crate) _sender: h3::client::SendRequest<OpenStreams, Bytes>,
+    pub(crate) stream: H3RequestStream,
+    pub(crate) _sender: H3Sender,
 }
 
 impl IrohH3ResponseBody {
-    pub(crate) fn new(
-        stream: h3::client::RequestStream<iroh_h3::BidiStream<Bytes>, Bytes>,
-        sender: h3::client::SendRequest<OpenStreams, Bytes>,
-    ) -> Self {
+    pub(crate) fn new(stream: H3RequestStream, sender: H3Sender) -> Self {
         Self {
             stream,
             _sender: sender,
