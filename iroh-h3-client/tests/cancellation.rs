@@ -191,6 +191,82 @@ async fn cancel_keeps_connection_reusable() {
 
 #[cfg_attr(not(target_family = "wasm"), tokio::test)]
 #[wasm_bindgen_test]
+async fn cancel_after_response_before_body_stream_then_convert_returns_cancelled() {
+    let endpoint_1 = Endpoint::bind(N0).await.unwrap();
+    let endpoint_2 = Endpoint::bind(N0).await.unwrap();
+    endpoint_1.online().await;
+    endpoint_2.online().await;
+
+    async fn stream() -> impl IntoResponse {
+        let chunk = Ok::<Bytes, std::convert::Infallible>(Bytes::from_static(b"chunk"));
+        AxumBody::from_stream(futures::stream::repeat(chunk).take(8))
+    }
+
+    let app = Router::new().route("/stream", get(stream));
+    let _router = iroh::protocol::Router::builder(endpoint_1.clone())
+        .accept(ALPN, IrohAxum::new(app))
+        .spawn();
+
+    let client = IrohH3Client::new(endpoint_2, ALPN.into());
+    let uri = format!("iroh+h3://{}/stream", endpoint_1.id());
+    let pending = client.get(&uri).send_cancellable().unwrap();
+    let handle = pending.cancel_handle();
+    let response = pending.await.unwrap();
+
+    handle.cancel();
+    let mut stream = response.cancellable_bytes_stream().unwrap();
+
+    assert!(matches!(stream.next().await, Some(Err(Error::Cancelled))));
+    assert!(stream.next().await.is_none());
+}
+
+#[cfg_attr(not(target_family = "wasm"), tokio::test)]
+#[wasm_bindgen_test]
+async fn cancel_after_response_before_body_stream_then_drop_cleans_up() {
+    let endpoint_1 = Endpoint::bind(N0).await.unwrap();
+    let endpoint_2 = Endpoint::bind(N0).await.unwrap();
+    endpoint_1.online().await;
+    endpoint_2.online().await;
+
+    async fn stream() -> impl IntoResponse {
+        let chunk = Ok::<Bytes, std::convert::Infallible>(Bytes::from_static(b"chunk"));
+        AxumBody::from_stream(futures::stream::repeat(chunk).take(32))
+    }
+
+    async fn ping() -> &'static str {
+        "pong"
+    }
+
+    let app = Router::new()
+        .route("/stream", get(stream))
+        .route("/ping", get(ping));
+    let _router = iroh::protocol::Router::builder(endpoint_1.clone())
+        .accept(ALPN, IrohAxum::new(app))
+        .spawn();
+
+    let client = IrohH3Client::new(endpoint_2, ALPN.into());
+    let stream_uri = format!("iroh+h3://{}/stream", endpoint_1.id());
+    let ping_uri = format!("iroh+h3://{}/ping", endpoint_1.id());
+    let pending = client.get(&stream_uri).send_cancellable().unwrap();
+    let handle = pending.cancel_handle();
+    let response = pending.await.unwrap();
+
+    handle.cancel();
+    drop(response);
+
+    let ping = client
+        .get(&ping_uri)
+        .send()
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    assert_eq!(ping, Bytes::from_static(b"pong"));
+}
+
+#[cfg_attr(not(target_family = "wasm"), tokio::test)]
+#[wasm_bindgen_test]
 async fn cancellable_response_legacy_bytes_stream_ignores_handle_cancel() {
     let endpoint_1 = Endpoint::bind(N0).await.unwrap();
     let endpoint_2 = Endpoint::bind(N0).await.unwrap();

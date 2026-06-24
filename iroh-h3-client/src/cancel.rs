@@ -523,6 +523,13 @@ impl CancellableH3Body {
     pub(crate) fn cancel_handle(&self) -> RequestCancelHandle {
         RequestCancelHandle::new(self.state.clone())
     }
+
+    fn cleanup_unfinished_response_body(&mut self) {
+        if let Some(stream) = self.stream.as_mut() {
+            let mut owner = H3StopOwner::new(stream);
+            self.state.apply_drop_cleanup_to_owner(&mut owner);
+        }
+    }
 }
 
 impl fmt::Debug for CancellableH3Body {
@@ -554,14 +561,15 @@ impl Stream for CancellableBytesStream {
         let Some(body) = self.body.as_mut() else {
             return Poll::Ready(None);
         };
-        body.state.waker.register(cx.waker());
+        let state = body.state.clone();
+        state.waker.register(cx.waker());
 
-        if body.state.is_cancelled() {
+        if state.is_cancelled() {
             if let Some(stream) = body.stream.as_mut() {
                 let mut owner = H3StopOwner::new(stream);
-                body.state.apply_cancel_to_owner(&mut owner);
+                state.apply_cancel_to_owner(&mut owner);
             }
-            if body.state.take_cancel_error_to_emit() {
+            if state.take_cancel_error_to_emit() {
                 self.body = None;
                 return Poll::Ready(Some(Err(Error::Cancelled)));
             }
@@ -601,10 +609,7 @@ impl Stream for CancellableBytesStream {
 impl Drop for CancellableBytesStream {
     fn drop(&mut self) {
         if let Some(body) = self.body.as_mut() {
-            if let Some(stream) = body.stream.as_mut() {
-                let mut owner = H3StopOwner::new(stream);
-                body.state.apply_drop_cleanup_to_owner(&mut owner);
-            }
+            body.cleanup_unfinished_response_body();
         }
     }
 }
@@ -612,10 +617,7 @@ impl Drop for CancellableBytesStream {
 impl Drop for CancellableH3Body {
     fn drop(&mut self) {
         let _ = &self.sender;
-        if let Some(stream) = self.stream.as_mut() {
-            let mut owner = H3StopOwner::new(stream);
-            self.state.apply_drop_cleanup_to_owner(&mut owner);
-        }
+        self.cleanup_unfinished_response_body();
     }
 }
 
@@ -672,10 +674,7 @@ impl http_body::Body for LegacyCompatibleH3ResponseBody {
 impl Drop for LegacyCompatibleH3ResponseBody {
     fn drop(&mut self) {
         if let Some(body) = self.body.as_mut() {
-            if let Some(stream) = body.stream.as_mut() {
-                let mut owner = H3StopOwner::new(stream);
-                body.state.apply_drop_cleanup_to_owner(&mut owner);
-            }
+            body.cleanup_unfinished_response_body();
         }
     }
 }
