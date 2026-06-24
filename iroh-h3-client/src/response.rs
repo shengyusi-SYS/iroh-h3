@@ -15,7 +15,7 @@ pub mod sse;
 
 use std::ops::Deref;
 use std::pin::Pin;
-use std::task::{Context, Poll, ready};
+use std::task::{ready, Context, Poll};
 
 use bytes::{Buf, Bytes};
 use futures::{Stream, StreamExt};
@@ -26,7 +26,7 @@ use serde::de::DeserializeOwned;
 use tracing::{debug, instrument, trace};
 
 use crate::body::Body;
-use crate::cancel::{H3RequestStream, H3Sender};
+use crate::cancel::{CancellableBytesStream, H3RequestStream, H3Sender};
 use crate::error::Error;
 use crate::response::sse::{SseEvent, SseStream};
 
@@ -203,6 +203,17 @@ impl Response {
     #[instrument(skip(self))]
     pub fn bytes_stream(self) -> impl Stream<Item = Result<Bytes, Error>> {
         self.body.into_stream().into_data_stream()
+    }
+
+    /// Returns a cancellable stream of response body chunks.
+    ///
+    /// # Errors
+    /// Returns [`Error::BodyNotCancellable`] if the response was not created by a
+    /// cancellable request.
+    #[instrument(skip(self))]
+    pub fn cancellable_bytes_stream(self) -> Result<CancellableBytesStream, Error> {
+        let body = self.body.into_cancellable_h3()?;
+        Ok(CancellableBytesStream::new(body))
     }
 
     /// Returns a stream of Server-Sent Events

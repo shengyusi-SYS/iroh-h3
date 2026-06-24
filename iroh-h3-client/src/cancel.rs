@@ -2,10 +2,10 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll, ready};
+use std::task::{ready, Context, Poll};
 
 use bytes::{Buf, Bytes};
-use futures::task::AtomicWaker;
+use futures::{task::AtomicWaker, Stream};
 use h3::error::Code;
 use http_body::Frame;
 use iroh_h3::OpenStreams;
@@ -28,8 +28,7 @@ pub struct PendingRequest {
 /// A response byte stream associated with a cancellation handle.
 #[allow(dead_code)]
 pub struct CancellableBytesStream {
-    state: Arc<CancellableRequestState>,
-    item: PhantomData<Result<Bytes, Error>>,
+    body: Option<CancellableH3Body>,
 }
 
 /// Handle used to cancel an in-flight request.
@@ -109,6 +108,20 @@ impl CancellableRequestState {
         inner.recv_terminal = true;
         inner.send_finished = true;
         inner.phase = RequestPhase::Complete;
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.inner.lock().expect("poisoned cancel state").cancelled
+    }
+
+    pub(crate) fn take_cancel_error_to_emit(&self) -> bool {
+        let mut inner = self.inner.lock().expect("poisoned cancel state");
+        if inner.cancel_error_emitted {
+            false
+        } else {
+            inner.cancel_error_emitted = true;
+            true
+        }
     }
 
     #[allow(dead_code)]
@@ -228,6 +241,83 @@ impl fmt::Debug for CancellableH3Body {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let _ = &self.sender;
         f.debug_struct("CancellableH3Body").finish_non_exhaustive()
+    }
+}
+
+impl CancellableBytesStream {
+    pub(crate) fn new(body: CancellableH3Body) -> Self {
+        Self { body: Some(body) }
+    }
+
+    /// Returns a handle that can cancel this response body stream.
+    pub fn cancel_handle(&self) -> RequestCancelHandle {
+        self.body
+            .as_ref()
+            .expect("cancellable stream polled after completion")
+            .cancel_handle()
+    }
+}
+
+impl Stream for CancellableBytesStream {
+    type Item = Result<Bytes, Error>;
+
+    #[instrument(skip(self, cx))]
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let Some(body) = self.body.as_mut() else {
+            return Poll::Ready(None);
+        };
+        body.state.waker.register(cx.waker());
+
+        if body.state.is_cancelled() {
+            if let Some(stream) = body.stream.as_mut() {
+                let mut owner = H3StopOwner::new(stream);
+                body.state.apply_cancel_to_owner(&mut owner);
+            }
+            if body.state.take_cancel_error_to_emit() {
+                self.body = None;
+                return Poll::Ready(Some(Err(Error::Cancelled)));
+            }
+            self.body = None;
+            return Poll::Ready(None);
+        }
+
+        let stream = body
+            .stream
+            .as_mut()
+            .expect("stream owner missing before terminal");
+        match ready!(stream.poll_recv_data(cx)).transpose() {
+            Some(Ok(mut frame)) => {
+                trace!("received a frame of {} bytes", frame.remaining());
+                let bytes = frame.copy_to_bytes(frame.remaining());
+                Poll::Ready(Some(Ok(bytes)))
+            }
+            Some(Err(err)) => {
+                body.state.mark_recv_terminal();
+                self.body = None;
+                if err.is_h3_no_error() {
+                    debug!("received H3_NO_ERROR");
+                    Poll::Ready(None)
+                } else {
+                    Poll::Ready(Some(Err(Error::Transport(err.into()))))
+                }
+            }
+            None => {
+                body.state.mark_recv_terminal();
+                self.body = None;
+                Poll::Ready(None)
+            }
+        }
+    }
+}
+
+impl Drop for CancellableBytesStream {
+    fn drop(&mut self) {
+        if let Some(body) = self.body.as_mut() {
+            if let Some(stream) = body.stream.as_mut() {
+                let mut owner = H3StopOwner::new(stream);
+                body.state.apply_drop_cleanup_to_owner(&mut owner);
+            }
+        }
     }
 }
 
