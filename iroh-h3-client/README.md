@@ -14,6 +14,7 @@
 - **Middleware & Interceptors:** Inject custom logic to modify requests and responses in the lifecycle.
 - **Redirect Handling:** Automatic support for following HTTP redirect jumps.
 - **Cookie Jar:** Stateful cookie management for handling sessions across requests.
+- **Cooperative request cancellation:** Concrete `IrohH3Client` requests can use `send_cancellable()` to obtain a `PendingRequest` and `RequestCancelHandle`. A+B support covers pending request setup, fixed-size request bodies, response headers, and response body streams. Streaming request body cancellation is outside this release scope and returns `Error::RequestBodyNotCancellable` from `send_cancellable()`.
 
 ## Optional Features
 

@@ -191,6 +191,66 @@ async fn cancel_keeps_connection_reusable() {
 
 #[cfg_attr(not(target_family = "wasm"), tokio::test)]
 #[wasm_bindgen_test]
+async fn body_read_pending_cancel_or_drop_is_safe() {
+    let endpoint_1 = Endpoint::bind(N0).await.unwrap();
+    let endpoint_2 = Endpoint::bind(N0).await.unwrap();
+    endpoint_1.online().await;
+    endpoint_2.online().await;
+
+    async fn delayed_body() -> impl IntoResponse {
+        let stream = futures::stream::unfold(false, |sent| async move {
+            if sent {
+                None
+            } else {
+                n0_future::time::sleep(std::time::Duration::from_millis(200)).await;
+                Some((
+                    Ok::<Bytes, std::convert::Infallible>(Bytes::from_static(b"late")),
+                    true,
+                ))
+            }
+        });
+        AxumBody::from_stream(stream)
+    }
+
+    async fn ping() -> &'static str {
+        "pong"
+    }
+
+    let app = Router::new()
+        .route("/delayed-body", get(delayed_body))
+        .route("/ping", get(ping));
+    let _router = iroh::protocol::Router::builder(endpoint_1.clone())
+        .accept(ALPN, IrohAxum::new(app))
+        .spawn();
+
+    let client = IrohH3Client::new(endpoint_2, ALPN.into());
+    let body_uri = format!("iroh+h3://{}/delayed-body", endpoint_1.id());
+    let ping_uri = format!("iroh+h3://{}/ping", endpoint_1.id());
+    let response = client
+        .get(&body_uri)
+        .send_cancellable()
+        .unwrap()
+        .await
+        .unwrap();
+    let stream = response.cancellable_bytes_stream().unwrap();
+    let handle = stream.cancel_handle();
+
+    handle.cancel();
+    drop(stream);
+
+    let ping = client
+        .get(&ping_uri)
+        .send()
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    assert_eq!(ping, Bytes::from_static(b"pong"));
+}
+
+#[cfg_attr(not(target_family = "wasm"), tokio::test)]
+#[wasm_bindgen_test]
 async fn cancel_after_response_before_body_stream_then_convert_returns_cancelled() {
     let endpoint_1 = Endpoint::bind(N0).await.unwrap();
     let endpoint_2 = Endpoint::bind(N0).await.unwrap();

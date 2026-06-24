@@ -691,9 +691,14 @@ impl<'a> H3StopOwner<'a> {
 
 impl StopOwner for H3StopOwner<'_> {
     fn stop_receive(&mut self) {
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.stream.stop_sending(REQUEST_CANCEL_CODE);
         }));
+        if result.is_err() {
+            tracing::debug!(
+                "receive-side stop_sending unavailable during pending read; downgraded to best-effort cleanup"
+            );
+        }
     }
 
     fn stop_send(&mut self) {
