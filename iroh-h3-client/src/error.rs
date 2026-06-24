@@ -35,6 +35,18 @@ use iroh::{KeyParsingError, endpoint::ConnectError};
 /// Main error type for the Iroh HTTP/3 client.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// Request execution was actively cancelled.
+    #[error("Request was cancelled")]
+    Cancelled,
+
+    /// Response body cannot be cancelled by the current API path.
+    #[error("Response body is not cancellable")]
+    BodyNotCancellable,
+
+    /// Request body cannot be cancelled by the current API path.
+    #[error("Request body is not cancellable")]
+    RequestBodyNotCancellable,
+
     /// Errors encountered while building or sending requests.
     #[error("Request validation error: {0}")]
     RequestValidation(#[from] RequestValidationError),

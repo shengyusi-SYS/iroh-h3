@@ -13,6 +13,7 @@
 //! - **Non-retry conditions**:
 //!     - 2xx successful responses
 //!     - 410 Gone responses
+//!     - Cooperative cancellation and non-cancellable API usage errors
 //! - **Body handling**: The request body is replaced with `Body::empty()` for retries to avoid replay issues.
 
 use crate::{
@@ -118,6 +119,15 @@ impl RetryFailures {
             }
 
             Err(err) => {
+                if matches!(
+                    err,
+                    Error::Cancelled
+                        | Error::BodyNotCancellable
+                        | Error::RequestBodyNotCancellable
+                ) {
+                    return Err(err);
+                }
+
                 *attempts += 1;
                 warn!(attempts = *attempts, error = ?err, "transport error; retrying");
 
@@ -248,6 +258,42 @@ mod tests {
         let resp = retry.handle(req, &service).await.unwrap();
 
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn cancelled_error_is_not_retried() {
+        let service = MockService::new(vec![Err(Error::Cancelled), Ok(ok_response())]);
+        let retry = RetryFailures::new(5, 0);
+        let req = Request::new(Body::empty());
+
+        let result = retry.handle(req, &service).await;
+
+        assert!(matches!(result, Err(Error::Cancelled)));
+    }
+
+    #[tokio::test]
+    async fn body_not_cancellable_error_is_not_retried() {
+        let service = MockService::new(vec![Err(Error::BodyNotCancellable), Ok(ok_response())]);
+        let retry = RetryFailures::new(5, 0);
+        let req = Request::new(Body::empty());
+
+        let result = retry.handle(req, &service).await;
+
+        assert!(matches!(result, Err(Error::BodyNotCancellable)));
+    }
+
+    #[tokio::test]
+    async fn request_body_not_cancellable_error_is_not_retried() {
+        let service = MockService::new(vec![
+            Err(Error::RequestBodyNotCancellable),
+            Ok(ok_response()),
+        ]);
+        let retry = RetryFailures::new(5, 0);
+        let req = Request::new(Body::empty());
+
+        let result = retry.handle(req, &service).await;
+
+        assert!(matches!(result, Err(Error::RequestBodyNotCancellable)));
     }
 
     #[tokio::test]
