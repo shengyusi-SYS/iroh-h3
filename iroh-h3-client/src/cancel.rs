@@ -74,8 +74,8 @@ pub(crate) trait StopOwner {
     fn stop_send(&mut self);
 }
 
-#[allow(dead_code)]
 impl CancellableRequestState {
+    #[allow(dead_code)]
     pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
             inner: Mutex::new(CancellableRequestInner {
@@ -91,10 +91,12 @@ impl CancellableRequestState {
         })
     }
 
+    #[allow(dead_code)]
     pub(crate) fn mark_phase(&self, phase: RequestPhase) {
         self.inner.lock().expect("poisoned cancel state").phase = phase;
     }
 
+    #[allow(dead_code)]
     pub(crate) fn mark_send_finished(&self) {
         self.inner
             .lock()
@@ -109,6 +111,7 @@ impl CancellableRequestState {
         inner.phase = RequestPhase::Complete;
     }
 
+    #[allow(dead_code)]
     pub(crate) fn apply_cancel_to_owner(&self, owner: &mut impl StopOwner) {
         let (stop_receive, stop_send) = {
             let mut inner = self.inner.lock().expect("poisoned cancel state");
@@ -163,8 +166,8 @@ impl CancellableRequestState {
     }
 }
 
-#[allow(dead_code)]
 impl RequestCancelHandle {
+    #[allow(dead_code)]
     pub(crate) fn new(state: Arc<CancellableRequestState>) -> Self {
         Self { state }
     }

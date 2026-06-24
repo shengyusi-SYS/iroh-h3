@@ -92,7 +92,7 @@ where
 }
 
 #[derive(Debug)]
-pub(crate) enum Inner {
+enum Inner {
     Bytes(Bytes),
     Stream(BoxBody<Bytes, Error>),
     #[allow(dead_code)]
