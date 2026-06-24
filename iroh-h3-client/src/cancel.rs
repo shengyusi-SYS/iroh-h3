@@ -671,7 +671,12 @@ impl http_body::Body for LegacyCompatibleH3ResponseBody {
 
 impl Drop for LegacyCompatibleH3ResponseBody {
     fn drop(&mut self) {
-        self.body.take();
+        if let Some(body) = self.body.as_mut() {
+            if let Some(stream) = body.stream.as_mut() {
+                let mut owner = H3StopOwner::new(stream);
+                body.state.apply_drop_cleanup_to_owner(&mut owner);
+            }
+        }
     }
 }
 
