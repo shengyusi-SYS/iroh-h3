@@ -191,6 +191,9 @@ impl<C: Service> RequestBuilder<C> {
 
 impl RequestBuilder<IrohH3Client> {
     /// Sends the request and returns a cancellable pending request.
+    ///
+    /// This concrete cancellable path uses the underlying transport directly
+    /// and does not run middleware configured on the client.
     #[inline]
     #[instrument(skip(self))]
     pub fn send_cancellable(self) -> Result<PendingRequest, Error> {
@@ -218,6 +221,8 @@ impl<C: Service> Request<C> {
 
 impl Request<IrohH3Client> {
     /// Sends this request through the concrete transport and returns a cancellable pending request.
+    ///
+    /// This path does not run middleware configured on the client.
     #[inline]
     #[instrument(skip(self))]
     pub fn send_cancellable(self) -> Result<PendingRequest, Error> {

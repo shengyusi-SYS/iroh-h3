@@ -132,11 +132,14 @@ impl IrohH3Client {
         }
     }
 
-    /// Creates a new `IrohH3Client` with a middleware layer applied to all requests.
+    /// Creates a new `IrohH3Client` with a middleware layer applied to regular requests.
     ///
     /// This constructor wraps the base HTTP/3 connection manager with the provided
     /// middleware, allowing interception, logging, modification, or other behaviors
-    /// for every request sent through this client.
+    /// for every request sent through [`Request::send`](crate::request::Request::send).
+    /// Concrete cancellable requests created with
+    /// [`send_cancellable`](crate::request::Request::send_cancellable) use the
+    /// underlying transport directly and do not run this middleware pipeline.
     ///
     /// # Parameters
     /// - `endpoint`: The QUIC `Endpoint` to use for connections.
@@ -144,7 +147,7 @@ impl IrohH3Client {
     /// - `middleware`: An implementation of the `Middleware` trait to wrap the client.
     ///
     /// # Returns
-    /// A new instance of `IrohH3Client` where all requests pass through the middleware.
+    /// A new instance of `IrohH3Client` where regular requests pass through the middleware.
     pub fn with_middleware(
         endpoint: Endpoint,
         alpn: Vec<u8>,
