@@ -29,12 +29,16 @@ pub struct PendingRequest {
 }
 
 type GetSenderFuture =
-    Pin<Box<dyn Future<Output = (http::Request<()>, Bytes, Result<H3Sender, Error>)>>>;
+    Pin<Box<dyn Future<Output = (http::Request<()>, Bytes, Result<H3Sender, Error>)> + Send>>;
 type SendRequestFuture =
-    Pin<Box<dyn Future<Output = (H3Sender, Bytes, Result<H3RequestStream, Error>)>>>;
-type StreamIoFuture = Pin<Box<dyn Future<Output = (H3Sender, H3RequestStream, Result<(), Error>)>>>;
-type RecvResponseFuture =
-    Pin<Box<dyn Future<Output = (H3Sender, H3RequestStream, Result<http::Response<()>, Error>)>>>;
+    Pin<Box<dyn Future<Output = (H3Sender, Bytes, Result<H3RequestStream, Error>)> + Send>>;
+type StreamIoFuture =
+    Pin<Box<dyn Future<Output = (H3Sender, H3RequestStream, Result<(), Error>)> + Send>>;
+type RecvResponseFuture = Pin<
+    Box<
+        dyn Future<Output = (H3Sender, H3RequestStream, Result<http::Response<()>, Error>)> + Send,
+    >,
+>;
 
 enum PendingRequestStage {
     BeforeStreamOpen {

@@ -5,7 +5,9 @@ use http_body::Frame;
 use http_body_util::{StreamBody, combinators::BoxBody};
 use iroh::{Endpoint, endpoint::presets::N0};
 use iroh_h3_axum::IrohAxum;
-use iroh_h3_client::{IrohH3Client, error::Error};
+use iroh_h3_client::{
+    CancellableBytesStream, IrohH3Client, PendingRequest, RequestCancelHandle, error::Error,
+};
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
@@ -14,6 +16,19 @@ use wasm_bindgen_test::wasm_bindgen_test;
 wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 
 const ALPN: &[u8] = b"iroh+h3";
+
+#[cfg(not(target_family = "wasm"))]
+#[test]
+fn cancellable_public_types_have_required_thread_bounds() {
+    fn assert_send<T: Send>() {}
+    fn assert_send_sync<T: Send + Sync>() {}
+    fn assert_clone<T: Clone>() {}
+
+    assert_send::<PendingRequest>();
+    assert_send::<CancellableBytesStream>();
+    assert_send_sync::<RequestCancelHandle>();
+    assert_clone::<RequestCancelHandle>();
+}
 
 #[cfg_attr(not(target_family = "wasm"), tokio::test)]
 #[wasm_bindgen_test]
