@@ -30,6 +30,31 @@ fn cancellable_public_types_have_required_thread_bounds() {
     assert_clone::<RequestCancelHandle>();
 }
 
+#[cfg(not(target_family = "wasm"))]
+struct TestApp {
+    endpoint: Endpoint,
+    client: IrohH3Client,
+    _router: iroh::protocol::Router,
+}
+
+#[cfg(not(target_family = "wasm"))]
+async fn spawn_test_app(app: Router) -> TestApp {
+    let server_endpoint = Endpoint::bind(N0).await.unwrap();
+    let client_endpoint = Endpoint::bind(N0).await.unwrap();
+    server_endpoint.online().await;
+    client_endpoint.online().await;
+
+    let router = iroh::protocol::Router::builder(server_endpoint.clone())
+        .accept(ALPN, IrohAxum::new(app))
+        .spawn();
+
+    TestApp {
+        endpoint: server_endpoint,
+        client: IrohH3Client::new(client_endpoint, ALPN.into()),
+        _router: router,
+    }
+}
+
 #[cfg_attr(not(target_family = "wasm"), tokio::test)]
 #[wasm_bindgen_test]
 async fn send_cancellable_returns_response_with_cancellable_body() {
@@ -151,6 +176,50 @@ async fn headers_pending_cancel_stops_waiting() {
     handle.cancel();
 
     let result = pending.await;
+    assert!(matches!(result, Err(Error::Cancelled)));
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spawned_pending_request_can_be_cancelled_from_external_handle() {
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let entered_tx = Arc::new(Mutex::new(Some(entered_tx)));
+
+    let app = Router::new().route(
+        "/late",
+        get({
+            let entered_tx = entered_tx.clone();
+            move || {
+                let entered_tx = entered_tx.clone();
+                async move {
+                    if let Some(tx) = entered_tx.lock().unwrap().take() {
+                        let _ = tx.send(());
+                    }
+                    n0_future::time::sleep(std::time::Duration::from_secs(60)).await;
+                    "late"
+                }
+            }
+        }),
+    );
+    let app = spawn_test_app(app).await;
+
+    let uri = format!("iroh+h3://{}/late", app.endpoint.id());
+    let pending = app.client.get(&uri).send_cancellable().unwrap();
+    let handle = pending.cancel_handle();
+    let task = tokio::spawn(pending);
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), entered_rx)
+        .await
+        .expect("server handler was not entered before timeout")
+        .expect("server handler sender was dropped");
+
+    handle.cancel();
+
+    let result = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+        .await
+        .expect("spawned pending request did not finish after cancellation")
+        .expect("spawned pending request task panicked");
+
     assert!(matches!(result, Err(Error::Cancelled)));
 }
 
