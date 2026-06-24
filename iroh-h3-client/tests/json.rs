@@ -1,7 +1,11 @@
 #![cfg(feature = "json")]
 
 use axum::{Json, Router, response::IntoResponse, routing::post};
-use iroh::{Endpoint, endpoint::presets::N0};
+#[cfg(not(target_family = "wasm"))]
+use iroh::{address_lookup::memory::MemoryLookup, endpoint::presets::Minimal};
+#[cfg(target_family = "wasm")]
+use iroh::endpoint::presets::N0;
+use iroh::Endpoint;
 use iroh_h3_axum::IrohAxum;
 use iroh_h3_client::IrohH3Client;
 
@@ -22,10 +26,34 @@ const PONG: &str = "Pong!";
 #[cfg_attr(not(target_family = "wasm"), tokio::test)]
 #[wasm_bindgen_test]
 async fn json_request_response() {
-    let endpoint_1 = Endpoint::bind(N0).await.unwrap();
-    let endpoint_2 = Endpoint::bind(N0).await.unwrap();
-    endpoint_1.online().await;
-    endpoint_2.online().await;
+    let (endpoint_1, endpoint_2) = {
+        #[cfg(not(target_family = "wasm"))]
+        {
+            let address_lookup = MemoryLookup::new();
+            let endpoint_1 = Endpoint::builder(Minimal)
+                .address_lookup(address_lookup.clone())
+                .bind()
+                .await
+                .unwrap();
+            let endpoint_2 = Endpoint::builder(Minimal)
+                .address_lookup(address_lookup.clone())
+                .bind()
+                .await
+                .unwrap();
+            address_lookup.add_endpoint_info(endpoint_1.addr());
+            address_lookup.add_endpoint_info(endpoint_2.addr());
+            (endpoint_1, endpoint_2)
+        }
+
+        #[cfg(target_family = "wasm")]
+        {
+            let endpoint_1 = Endpoint::bind(N0).await.unwrap();
+            let endpoint_2 = Endpoint::bind(N0).await.unwrap();
+            endpoint_1.online().await;
+            endpoint_2.online().await;
+            (endpoint_1, endpoint_2)
+        }
+    };
 
     async fn ping(Json(msg): Json<Message>) -> impl IntoResponse {
         assert_eq!(msg.message, PING);

@@ -10,7 +10,11 @@ use bytes::Bytes;
 use futures::StreamExt;
 use http_body::Frame;
 use http_body_util::{StreamBody, combinators::BoxBody};
-use iroh::{Endpoint, endpoint::presets::N0};
+#[cfg(not(target_family = "wasm"))]
+use iroh::{address_lookup::memory::MemoryLookup, endpoint::presets::Minimal};
+#[cfg(target_family = "wasm")]
+use iroh::endpoint::presets::N0;
+use iroh::Endpoint;
 use iroh_h3_axum::IrohAxum;
 use iroh_h3_client::IrohH3Client;
 use wasm_bindgen_test::wasm_bindgen_test;
@@ -22,10 +26,34 @@ const ALPN: &[u8] = b"iroh+h3";
 #[cfg_attr(not(target_family = "wasm"), tokio::test)]
 #[wasm_bindgen_test]
 async fn streaming_response() {
-    let endpoint_1 = Endpoint::bind(N0).await.unwrap();
-    let endpoint_2 = Endpoint::bind(N0).await.unwrap();
-    endpoint_1.online().await;
-    endpoint_2.online().await;
+    let (endpoint_1, endpoint_2) = {
+        #[cfg(not(target_family = "wasm"))]
+        {
+            let address_lookup = MemoryLookup::new();
+            let endpoint_1 = Endpoint::builder(Minimal)
+                .address_lookup(address_lookup.clone())
+                .bind()
+                .await
+                .unwrap();
+            let endpoint_2 = Endpoint::builder(Minimal)
+                .address_lookup(address_lookup.clone())
+                .bind()
+                .await
+                .unwrap();
+            address_lookup.add_endpoint_info(endpoint_1.addr());
+            address_lookup.add_endpoint_info(endpoint_2.addr());
+            (endpoint_1, endpoint_2)
+        }
+
+        #[cfg(target_family = "wasm")]
+        {
+            let endpoint_1 = Endpoint::bind(N0).await.unwrap();
+            let endpoint_2 = Endpoint::bind(N0).await.unwrap();
+            endpoint_1.online().await;
+            endpoint_2.online().await;
+            (endpoint_1, endpoint_2)
+        }
+    };
 
     /// server: stream "Pong!" 10 times
     async fn streaming_ping() -> impl IntoResponse {
@@ -55,10 +83,34 @@ async fn streaming_response() {
 #[cfg_attr(not(target_family = "wasm"), tokio::test)]
 #[wasm_bindgen_test]
 async fn streaming_request_body() {
-    let endpoint_1 = Endpoint::bind(N0).await.unwrap();
-    let endpoint_2 = Endpoint::bind(N0).await.unwrap();
-    endpoint_1.online().await;
-    endpoint_2.online().await;
+    let (endpoint_1, endpoint_2) = {
+        #[cfg(not(target_family = "wasm"))]
+        {
+            let address_lookup = MemoryLookup::new();
+            let endpoint_1 = Endpoint::builder(Minimal)
+                .address_lookup(address_lookup.clone())
+                .bind()
+                .await
+                .unwrap();
+            let endpoint_2 = Endpoint::builder(Minimal)
+                .address_lookup(address_lookup.clone())
+                .bind()
+                .await
+                .unwrap();
+            address_lookup.add_endpoint_info(endpoint_1.addr());
+            address_lookup.add_endpoint_info(endpoint_2.addr());
+            (endpoint_1, endpoint_2)
+        }
+
+        #[cfg(target_family = "wasm")]
+        {
+            let endpoint_1 = Endpoint::bind(N0).await.unwrap();
+            let endpoint_2 = Endpoint::bind(N0).await.unwrap();
+            endpoint_1.online().await;
+            endpoint_2.online().await;
+            (endpoint_1, endpoint_2)
+        }
+    };
 
     const PING: &str = "Ping!";
     const PING_COUNT: usize = 5;
