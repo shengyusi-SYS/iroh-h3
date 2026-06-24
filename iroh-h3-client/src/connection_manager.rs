@@ -24,6 +24,7 @@ use tracing::trace;
 use tracing::warn;
 
 use crate::body::Body;
+use crate::cancel::PendingRequest;
 use crate::error::Error;
 use crate::error::RequestValidationError;
 use crate::middleware::Service;
@@ -202,6 +203,18 @@ impl ConnectionManager {
             }
         }
         Ok(())
+    }
+
+    pub(crate) fn start_cancellable_request(
+        &self,
+        request: http::Request<Body>,
+    ) -> Result<PendingRequest, Error> {
+        let peer_id = peer_id(request.uri())?;
+        let (mut parts, body) = request.into_parts();
+        let body = body.into_fixed_bytes_for_cancellable_request()?;
+        parts.version = Version::HTTP_3;
+        let request = http::Request::from_parts(parts, ());
+        Ok(PendingRequest::new(self.clone(), peer_id, request, body))
     }
 }
 

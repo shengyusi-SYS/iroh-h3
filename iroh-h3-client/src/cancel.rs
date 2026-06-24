@@ -1,16 +1,20 @@
 use std::fmt;
+use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::task::{ready, Context, Poll};
+use std::task::{Context, Poll, ready};
 
 use bytes::{Buf, Bytes};
-use futures::{task::AtomicWaker, Stream};
+use futures::{Stream, task::AtomicWaker};
 use h3::error::Code;
 use http_body::Frame;
+use iroh::EndpointId;
 use iroh_h3::OpenStreams;
 use tracing::{debug, instrument, trace};
 
+use crate::body::Body;
+use crate::connection_manager::ConnectionManager;
 use crate::error::Error;
 use crate::response::Response;
 
@@ -18,11 +22,33 @@ pub(crate) type H3RequestStream = h3::client::RequestStream<iroh_h3::BidiStream<
 pub(crate) type H3Sender = h3::client::SendRequest<OpenStreams, Bytes>;
 
 /// A cancellable request that has been created but not yet resolved.
-#[allow(dead_code)]
 pub struct PendingRequest {
     state: Arc<CancellableRequestState>,
-    sender: Option<H3Sender>,
+    stage: PendingRequestStage,
     response: PhantomData<Result<Response, Error>>,
+}
+
+type GetSenderFuture =
+    Pin<Box<dyn Future<Output = (http::Request<()>, Bytes, Result<H3Sender, Error>)>>>;
+type SendRequestFuture =
+    Pin<Box<dyn Future<Output = (H3Sender, Bytes, Result<H3RequestStream, Error>)>>>;
+type StreamIoFuture = Pin<Box<dyn Future<Output = (H3Sender, H3RequestStream, Result<(), Error>)>>>;
+type RecvResponseFuture =
+    Pin<Box<dyn Future<Output = (H3Sender, H3RequestStream, Result<http::Response<()>, Error>)>>>;
+
+enum PendingRequestStage {
+    BeforeStreamOpen {
+        connection_manager: ConnectionManager,
+        peer_id: EndpointId,
+        request: Option<http::Request<()>>,
+        body: Bytes,
+    },
+    GettingSender(GetSenderFuture),
+    SendingRequestHeaders(SendRequestFuture),
+    SendingRequestBody(StreamIoFuture),
+    FinishingRequest(StreamIoFuture),
+    WaitingResponseHeaders(RecvResponseFuture),
+    Complete,
 }
 
 /// A response byte stream associated with a cancellation handle.
@@ -71,6 +97,268 @@ pub(crate) const REQUEST_CANCEL_CODE: Code = Code::H3_REQUEST_CANCELLED;
 pub(crate) trait StopOwner {
     fn stop_receive(&mut self);
     fn stop_send(&mut self);
+}
+
+impl PendingRequest {
+    pub(crate) fn new(
+        connection_manager: ConnectionManager,
+        peer_id: EndpointId,
+        request: http::Request<()>,
+        body: Bytes,
+    ) -> Self {
+        Self {
+            state: CancellableRequestState::new(),
+            stage: PendingRequestStage::BeforeStreamOpen {
+                connection_manager,
+                peer_id,
+                request: Some(request),
+                body,
+            },
+            response: PhantomData,
+        }
+    }
+
+    /// Returns a handle that can cancel this pending request.
+    pub fn cancel_handle(&self) -> RequestCancelHandle {
+        RequestCancelHandle::new(self.state.clone())
+    }
+}
+
+impl Unpin for PendingRequest {}
+
+impl Future for PendingRequest {
+    type Output = Result<Response, Error>;
+
+    #[instrument(skip(self, cx))]
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        this.state.waker.register(cx.waker());
+
+        loop {
+            if this.state.is_cancelled() {
+                this.stage = PendingRequestStage::Complete;
+                return Poll::Ready(Err(Error::Cancelled));
+            }
+
+            match &mut this.stage {
+                PendingRequestStage::BeforeStreamOpen {
+                    connection_manager,
+                    peer_id,
+                    request,
+                    body,
+                } => {
+                    this.state.mark_phase(RequestPhase::OpeningRequestStream);
+                    let future = get_sender_owned(
+                        connection_manager.clone(),
+                        *peer_id,
+                        request.take().expect("request missing before stream open"),
+                        body.clone(),
+                    );
+                    this.stage = PendingRequestStage::GettingSender(Box::pin(future));
+                }
+                PendingRequestStage::GettingSender(future) => {
+                    let (request, body, result) = ready!(future.as_mut().poll(cx));
+                    let sender = match result {
+                        Ok(sender) => sender,
+                        Err(err) => {
+                            this.stage = PendingRequestStage::Complete;
+                            return Poll::Ready(Err(err));
+                        }
+                    };
+
+                    this.state.mark_phase(RequestPhase::SendingRequestHeaders);
+                    this.stage = PendingRequestStage::SendingRequestHeaders(Box::pin(
+                        send_request_owned(sender, request, body),
+                    ));
+                }
+                PendingRequestStage::SendingRequestHeaders(future) => {
+                    let (sender, body, result) = ready!(future.as_mut().poll(cx));
+                    let stream = match result {
+                        Ok(stream) => stream,
+                        Err(err) => {
+                            this.stage = PendingRequestStage::Complete;
+                            return Poll::Ready(Err(err));
+                        }
+                    };
+
+                    this.state.mark_phase(RequestPhase::SendingRequestBody);
+                    this.stage = PendingRequestStage::SendingRequestBody(Box::pin(
+                        send_body_owned(sender, stream, body, this.state.clone()),
+                    ));
+                }
+                PendingRequestStage::SendingRequestBody(future) => {
+                    let (sender, mut stream, result) = ready!(future.as_mut().poll(cx));
+                    if let Err(err) = result {
+                        let mut owner = H3StopOwner::new(&mut stream);
+                        this.state.apply_drop_cleanup_to_owner(&mut owner);
+                        this.stage = PendingRequestStage::Complete;
+                        return Poll::Ready(Err(err));
+                    }
+
+                    this.state.mark_phase(RequestPhase::FinishingRequest);
+                    this.stage = PendingRequestStage::FinishingRequest(Box::pin(
+                        finish_request_owned(sender, stream, this.state.clone()),
+                    ));
+                }
+                PendingRequestStage::FinishingRequest(future) => {
+                    let (sender, mut stream, result) = ready!(future.as_mut().poll(cx));
+                    if let Err(err) = result {
+                        let mut owner = H3StopOwner::new(&mut stream);
+                        this.state.apply_drop_cleanup_to_owner(&mut owner);
+                        this.stage = PendingRequestStage::Complete;
+                        return Poll::Ready(Err(err));
+                    }
+
+                    this.state.mark_send_finished();
+                    this.state.mark_phase(RequestPhase::WaitingResponseHeaders);
+                    this.stage = PendingRequestStage::WaitingResponseHeaders(Box::pin(
+                        recv_response_owned(sender, stream, this.state.clone()),
+                    ));
+                }
+                PendingRequestStage::WaitingResponseHeaders(future) => {
+                    let (sender, mut stream, result) = ready!(future.as_mut().poll(cx));
+                    let response = match result {
+                        Ok(response) => response,
+                        Err(err) => {
+                            let mut owner = H3StopOwner::new(&mut stream);
+                            this.state.apply_drop_cleanup_to_owner(&mut owner);
+                            this.stage = PendingRequestStage::Complete;
+                            return Poll::Ready(Err(err));
+                        }
+                    };
+
+                    let (inner, ()) = response.into_parts();
+                    let body = Body::cancellable_h3(CancellableH3Body::new(
+                        stream,
+                        sender,
+                        this.state.clone(),
+                    ));
+                    this.stage = PendingRequestStage::Complete;
+                    return Poll::Ready(Ok(Response { inner, body }));
+                }
+                PendingRequestStage::Complete => {
+                    return Poll::Ready(Err(Error::Cancelled));
+                }
+            }
+        }
+    }
+}
+
+impl Drop for PendingRequest {
+    fn drop(&mut self) {
+        self.stage = PendingRequestStage::Complete;
+    }
+}
+
+async fn get_sender_owned(
+    connection_manager: ConnectionManager,
+    peer_id: EndpointId,
+    request: http::Request<()>,
+    body: Bytes,
+) -> (http::Request<()>, Bytes, Result<H3Sender, Error>) {
+    let result = connection_manager.get_sender(peer_id).await;
+    (request, body, result)
+}
+
+async fn send_request_owned(
+    mut sender: H3Sender,
+    request: http::Request<()>,
+    body: Bytes,
+) -> (H3Sender, Bytes, Result<H3RequestStream, Error>) {
+    let result = sender
+        .send_request(request)
+        .await
+        .map_err(|err| Error::Transport(err.into()));
+    (sender, body, result)
+}
+
+async fn send_body_owned(
+    sender: H3Sender,
+    stream: H3RequestStream,
+    body: Bytes,
+    state: Arc<CancellableRequestState>,
+) -> (H3Sender, H3RequestStream, Result<(), Error>) {
+    let mut owner = OwnedStreamGuard::new(stream, state);
+    let result = if body.is_empty() {
+        Ok(())
+    } else {
+        owner
+            .stream_mut()
+            .send_data(body)
+            .await
+            .map_err(|err| Error::Transport(err.into()))
+    };
+    let stream = owner.take_stream();
+    (sender, stream, result)
+}
+
+async fn finish_request_owned(
+    sender: H3Sender,
+    stream: H3RequestStream,
+    state: Arc<CancellableRequestState>,
+) -> (H3Sender, H3RequestStream, Result<(), Error>) {
+    let mut owner = OwnedStreamGuard::new(stream, state);
+    let result = owner
+        .stream_mut()
+        .finish()
+        .await
+        .map_err(|err| Error::Transport(err.into()));
+    let stream = owner.take_stream();
+    (sender, stream, result)
+}
+
+async fn recv_response_owned(
+    sender: H3Sender,
+    stream: H3RequestStream,
+    state: Arc<CancellableRequestState>,
+) -> (H3Sender, H3RequestStream, Result<http::Response<()>, Error>) {
+    let mut owner = OwnedStreamGuard::new(stream, state);
+    let result = owner
+        .stream_mut()
+        .recv_response()
+        .await
+        .map_err(|err| Error::Transport(err.into()));
+    let stream = owner.take_stream();
+    (sender, stream, result)
+}
+
+struct OwnedStreamGuard {
+    stream: Option<H3RequestStream>,
+    state: Arc<CancellableRequestState>,
+}
+
+impl OwnedStreamGuard {
+    fn new(stream: H3RequestStream, state: Arc<CancellableRequestState>) -> Self {
+        Self {
+            stream: Some(stream),
+            state,
+        }
+    }
+
+    fn stream_mut(&mut self) -> &mut H3RequestStream {
+        self.stream
+            .as_mut()
+            .expect("stream owner missing during request operation")
+    }
+
+    fn take_stream(&mut self) -> H3RequestStream {
+        self.stream
+            .take()
+            .expect("stream owner missing after request operation")
+    }
+}
+
+impl Drop for OwnedStreamGuard {
+    fn drop(&mut self) {
+        if let Some(stream) = self.stream.as_mut() {
+            let mut owner = H3StopOwner::new(stream);
+            if self.state.is_cancelled() {
+                self.state.apply_cancel_to_owner(&mut owner);
+            } else {
+                self.state.apply_drop_cleanup_to_owner(&mut owner);
+            }
+        }
+    }
 }
 
 impl CancellableRequestState {

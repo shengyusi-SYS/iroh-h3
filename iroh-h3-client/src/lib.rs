@@ -89,12 +89,14 @@ pub struct IrohH3Client {
 
 struct ClientInner {
     service: Pipeline,
+    transport: ConnectionManager,
 }
 
 impl Debug for ClientInner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ClientInner")
             .field("service", &"...")
+            .field("transport", &self.transport)
             .finish()
     }
 }
@@ -122,10 +124,9 @@ impl IrohH3Client {
     /// The ALPN string is used during QUIC connection negotiation to select the
     /// HTTP/3 protocol variant.
     pub fn new(endpoint: Endpoint, alpn: Vec<u8>) -> Self {
-        let connection_manager = ConnectionManager::new(endpoint, alpn);
-        let inner = ClientInner {
-            service: Pipeline::new(connection_manager),
-        };
+        let transport = ConnectionManager::new(endpoint, alpn);
+        let service = Pipeline::new(transport.clone());
+        let inner = ClientInner { service, transport };
         Self {
             inner: Arc::new(inner),
         }
@@ -149,8 +150,9 @@ impl IrohH3Client {
         alpn: Vec<u8>,
         middleware: impl Middleware + 'static,
     ) -> Self {
-        let service = Pipeline::with_middleware(middleware, ConnectionManager::new(endpoint, alpn));
-        let inner = ClientInner { service };
+        let transport = ConnectionManager::new(endpoint, alpn);
+        let service = Pipeline::with_middleware(middleware, transport.clone());
+        let inner = ClientInner { service, transport };
         Self {
             inner: Arc::new(inner),
         }
@@ -167,9 +169,10 @@ impl IrohH3Client {
         middleware: impl Middleware + 'static,
         disconnect_tx: tokio::sync::broadcast::Sender<EndpointId>,
     ) -> Self {
-        let cm = ConnectionManager::new(endpoint, alpn).with_disconnect_notify(disconnect_tx);
-        let service = Pipeline::with_middleware(middleware, cm);
-        let inner = ClientInner { service };
+        let transport =
+            ConnectionManager::new(endpoint, alpn).with_disconnect_notify(disconnect_tx);
+        let service = Pipeline::with_middleware(middleware, transport.clone());
+        let inner = ClientInner { service, transport };
         Self {
             inner: Arc::new(inner),
         }
@@ -204,6 +207,13 @@ impl IrohH3Client {
     http_method!(put, Method::PUT);
     http_method!(patch, Method::PATCH);
     http_method!(delete, Method::DELETE);
+
+    pub(crate) fn start_cancellable_request(
+        &self,
+        request: http::Request<Body>,
+    ) -> Result<PendingRequest, Error> {
+        self.inner.transport.start_cancellable_request(request)
+    }
 }
 
 impl Service for IrohH3Client {

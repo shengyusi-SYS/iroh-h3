@@ -19,6 +19,7 @@ use tracing::instrument;
 
 use crate::IrohH3Client;
 use crate::body::Body;
+use crate::cancel::PendingRequest;
 use crate::middleware::Service;
 use crate::{error::Error, response::Response};
 
@@ -188,6 +189,15 @@ impl<C: Service> RequestBuilder<C> {
     }
 }
 
+impl RequestBuilder<IrohH3Client> {
+    /// Sends the request and returns a cancellable pending request.
+    #[inline]
+    #[instrument(skip(self))]
+    pub fn send_cancellable(self) -> Result<PendingRequest, Error> {
+        self.build()?.send_cancellable()
+    }
+}
+
 /// Represents an HTTP/3 request constructed by [`RequestBuilder`].
 #[must_use]
 #[derive(Debug)]
@@ -203,6 +213,15 @@ impl<C: Service> Request<C> {
     pub async fn send(self) -> Result<Response, Error> {
         let response = self.client.handle(self.inner).await?;
         Ok(response.into())
+    }
+}
+
+impl Request<IrohH3Client> {
+    /// Sends this request through the concrete transport and returns a cancellable pending request.
+    #[inline]
+    #[instrument(skip(self))]
+    pub fn send_cancellable(self) -> Result<PendingRequest, Error> {
+        self.client.start_cancellable_request(self.inner)
     }
 }
 

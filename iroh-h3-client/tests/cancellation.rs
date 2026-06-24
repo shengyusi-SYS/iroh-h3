@@ -1,14 +1,46 @@
-use axum::{body::Body as AxumBody, response::IntoResponse, routing::get, Router};
+use axum::{Router, body::Body as AxumBody, response::IntoResponse, routing::get};
 use bytes::Bytes;
 use futures::StreamExt;
-use iroh::{endpoint::presets::N0, Endpoint};
+use iroh::{Endpoint, endpoint::presets::N0};
 use iroh_h3_axum::IrohAxum;
-use iroh_h3_client::{error::Error, IrohH3Client};
+use iroh_h3_client::{IrohH3Client, error::Error};
 use wasm_bindgen_test::wasm_bindgen_test;
 
 wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 
 const ALPN: &[u8] = b"iroh+h3";
+
+#[cfg_attr(not(target_family = "wasm"), tokio::test)]
+#[wasm_bindgen_test]
+async fn send_cancellable_returns_response_with_cancellable_body() {
+    let endpoint_1 = Endpoint::bind(N0).await.unwrap();
+    let endpoint_2 = Endpoint::bind(N0).await.unwrap();
+    endpoint_1.online().await;
+    endpoint_2.online().await;
+
+    async fn hello() -> &'static str {
+        "hello"
+    }
+
+    let app = Router::new().route("/hello", get(hello));
+    let _router = iroh::protocol::Router::builder(endpoint_1.clone())
+        .accept(ALPN, IrohAxum::new(app))
+        .spawn();
+
+    let client = IrohH3Client::new(endpoint_2, ALPN.into());
+    let uri = format!("iroh+h3://{}/hello", endpoint_1.id());
+    let pending = client.get(&uri).send_cancellable().unwrap();
+    let handle = pending.cancel_handle();
+    assert!(!handle.is_cancelled());
+
+    let response = pending.await.unwrap();
+    let mut stream = response.cancellable_bytes_stream().unwrap();
+    assert_eq!(
+        stream.next().await.transpose().unwrap().unwrap(),
+        Bytes::from_static(b"hello")
+    );
+    assert!(stream.next().await.is_none());
+}
 
 #[cfg_attr(not(target_family = "wasm"), tokio::test)]
 #[wasm_bindgen_test]
