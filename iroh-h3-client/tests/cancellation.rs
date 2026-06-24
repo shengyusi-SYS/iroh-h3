@@ -4,6 +4,8 @@ use futures::StreamExt;
 use http_body::Frame;
 use http_body_util::{StreamBody, combinators::BoxBody};
 use iroh::{Endpoint, endpoint::presets::N0};
+#[cfg(not(target_family = "wasm"))]
+use iroh::{address_lookup::memory::MemoryLookup, endpoint::presets::Minimal};
 use iroh_h3_axum::IrohAxum;
 use iroh_h3_client::{
     CancellableBytesStream, IrohH3Client, PendingRequest, RequestCancelHandle, error::Error,
@@ -39,10 +41,19 @@ struct TestApp {
 
 #[cfg(not(target_family = "wasm"))]
 async fn spawn_test_app(app: Router) -> TestApp {
-    let server_endpoint = Endpoint::bind(N0).await.unwrap();
-    let client_endpoint = Endpoint::bind(N0).await.unwrap();
-    server_endpoint.online().await;
-    client_endpoint.online().await;
+    let address_lookup = MemoryLookup::new();
+    let server_endpoint = Endpoint::builder(Minimal)
+        .address_lookup(address_lookup.clone())
+        .bind()
+        .await
+        .unwrap();
+    let client_endpoint = Endpoint::builder(Minimal)
+        .address_lookup(address_lookup.clone())
+        .bind()
+        .await
+        .unwrap();
+    address_lookup.add_endpoint_info(server_endpoint.addr());
+    address_lookup.add_endpoint_info(client_endpoint.addr());
 
     let router = iroh::protocol::Router::builder(server_endpoint.clone())
         .accept(ALPN, IrohAxum::new(app))
@@ -118,6 +129,73 @@ async fn body_cancel_returns_cancelled_once() {
 
     assert!(matches!(first, Some(Err(Error::Cancelled))));
     assert!(second.is_none());
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spawned_cancellable_body_stream_can_be_cancelled_from_external_handle() {
+    async fn delayed_body() -> impl IntoResponse {
+        let stream = futures::stream::unfold((), |_| async move {
+            n0_future::time::sleep(std::time::Duration::from_secs(60)).await;
+            Some((
+                Ok::<Bytes, std::convert::Infallible>(Bytes::from_static(b"late")),
+                (),
+            ))
+        });
+        AxumBody::from_stream(stream)
+    }
+
+    let app = Router::new().route("/delayed-body", get(delayed_body));
+    let app = spawn_test_app(app).await;
+
+    let uri = format!("iroh+h3://{}/delayed-body", app.endpoint.id());
+    let response = app
+        .client
+        .get(&uri)
+        .send_cancellable()
+        .unwrap()
+        .await
+        .unwrap();
+    let stream = response.cancellable_bytes_stream().unwrap();
+    let handle = stream.cancel_handle();
+    let (polling_tx, polling_rx) = tokio::sync::oneshot::channel();
+
+    let task = tokio::spawn(async move {
+        let mut stream = stream;
+        let mut next = Box::pin(stream.next());
+        let mut polling_tx = Some(polling_tx);
+
+        let first_poll = futures::future::poll_fn(|cx| match next.as_mut().poll(cx) {
+            Poll::Ready(item) => Poll::Ready(Some(item)),
+            Poll::Pending => {
+                if let Some(tx) = polling_tx.take() {
+                    let _ = tx.send(());
+                }
+                Poll::Ready(None)
+            }
+        })
+        .await;
+
+        if let Some(item) = first_poll {
+            return item;
+        }
+
+        next.await
+    });
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), polling_rx)
+        .await
+        .expect("spawned body task did not start before timeout")
+        .expect("spawned body task dropped startup sender");
+
+    handle.cancel();
+
+    let item = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+        .await
+        .expect("spawned body stream did not finish after cancellation")
+        .expect("spawned body stream task panicked");
+
+    assert!(matches!(item, Some(Err(Error::Cancelled))));
 }
 
 #[cfg_attr(not(target_family = "wasm"), tokio::test)]
