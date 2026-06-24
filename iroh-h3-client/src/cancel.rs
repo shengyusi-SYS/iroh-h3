@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
 
@@ -11,10 +9,12 @@ use iroh_h3::OpenStreams;
 use crate::error::Error;
 use crate::response::Response;
 
+#[allow(dead_code)]
 pub(crate) type H3RequestStream = h3::client::RequestStream<iroh_h3::BidiStream<Bytes>, Bytes>;
 pub(crate) type H3Sender = h3::client::SendRequest<OpenStreams, Bytes>;
 
 /// A cancellable request that has been created but not yet resolved.
+#[allow(dead_code)]
 pub struct PendingRequest {
     state: Arc<CancellableRequestState>,
     sender: Option<H3Sender>,
@@ -22,6 +22,7 @@ pub struct PendingRequest {
 }
 
 /// A response byte stream associated with a cancellation handle.
+#[allow(dead_code)]
 pub struct CancellableBytesStream {
     state: Arc<CancellableRequestState>,
     item: PhantomData<Result<Bytes, Error>>,
@@ -38,6 +39,7 @@ pub(crate) struct CancellableRequestState {
     waker: AtomicWaker,
 }
 
+#[allow(dead_code)]
 pub(crate) struct CancellableRequestInner {
     cancelled: bool,
     phase: RequestPhase,
@@ -48,6 +50,7 @@ pub(crate) struct CancellableRequestInner {
     cancel_error_emitted: bool,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RequestPhase {
     BeforeStreamOpen,
@@ -60,13 +63,16 @@ pub(crate) enum RequestPhase {
     Complete,
 }
 
+#[allow(dead_code)]
 pub(crate) const REQUEST_CANCEL_CODE: Code = Code::H3_REQUEST_CANCELLED;
 
+#[allow(dead_code)]
 pub(crate) trait StopOwner {
     fn stop_receive(&mut self);
     fn stop_send(&mut self);
 }
 
+#[allow(dead_code)]
 impl CancellableRequestState {
     pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
@@ -97,6 +103,7 @@ impl CancellableRequestState {
     pub(crate) fn mark_recv_terminal(&self) {
         let mut inner = self.inner.lock().expect("poisoned cancel state");
         inner.recv_terminal = true;
+        inner.send_finished = true;
         inner.phase = RequestPhase::Complete;
     }
 
@@ -131,19 +138,9 @@ impl CancellableRequestState {
     pub(crate) fn apply_drop_cleanup_to_owner(&self, owner: &mut impl StopOwner) {
         let (stop_receive, stop_send) = {
             let mut inner = self.inner.lock().expect("poisoned cancel state");
-            if inner.recv_terminal || matches!(inner.phase, RequestPhase::Complete) {
-                return;
-            }
 
-            let stop_receive = !inner.receive_stop_sent;
-            let stop_send = !inner.send_finished
-                && !inner.send_stop_sent
-                && matches!(
-                    inner.phase,
-                    RequestPhase::SendingRequestHeaders
-                        | RequestPhase::SendingRequestBody
-                        | RequestPhase::FinishingRequest
-                );
+            let stop_receive = !inner.recv_terminal && !inner.receive_stop_sent;
+            let stop_send = !inner.send_finished && !inner.send_stop_sent;
 
             if stop_receive {
                 inner.receive_stop_sent = true;
@@ -164,6 +161,7 @@ impl CancellableRequestState {
     }
 }
 
+#[allow(dead_code)]
 impl RequestCancelHandle {
     pub(crate) fn new(state: Arc<CancellableRequestState>) -> Self {
         Self { state }
@@ -193,10 +191,12 @@ impl RequestCancelHandle {
     }
 }
 
+#[allow(dead_code)]
 pub(crate) struct H3StopOwner<'a> {
     stream: &'a mut H3RequestStream,
 }
 
+#[allow(dead_code)]
 impl<'a> H3StopOwner<'a> {
     pub(crate) fn new(stream: &'a mut H3RequestStream) -> Self {
         Self { stream }
