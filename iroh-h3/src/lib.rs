@@ -407,6 +407,7 @@ type ReadChunkFuture = Pin<
                     Result<Option<Bytes>, iroh::endpoint::ReadError>,
                 ),
             > + Send
+            + Sync
             + 'static,
     >,
 >;

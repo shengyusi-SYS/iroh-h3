@@ -207,6 +207,169 @@ async fn spawned_cancellable_body_stream_can_be_cancelled_from_external_handle()
     assert!(matches!(item, Some(Err(Error::Cancelled))));
 }
 
+#[cfg(not(target_family = "wasm"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pending_cancellable_body_cancel_returns_cancelled_and_reuses_connection() {
+    async fn delayed_body() -> impl IntoResponse {
+        let stream = futures::stream::unfold((), |_| async move {
+            n0_future::time::sleep(std::time::Duration::from_secs(60)).await;
+            Some((
+                Ok::<Bytes, std::convert::Infallible>(Bytes::from_static(b"late")),
+                (),
+            ))
+        });
+        AxumBody::from_stream(stream)
+    }
+
+    async fn ping() -> &'static str {
+        "pong"
+    }
+
+    let app = Router::new()
+        .route("/delayed-body", get(delayed_body))
+        .route("/ping", get(ping));
+    let app = spawn_test_app(app).await;
+
+    let body_uri = format!("iroh+h3://{}/delayed-body", app.endpoint.id());
+    let ping_uri = format!("iroh+h3://{}/ping", app.endpoint.id());
+    let response = app
+        .client
+        .get(&body_uri)
+        .send_cancellable()
+        .unwrap()
+        .await
+        .unwrap();
+    let stream = response.cancellable_bytes_stream().unwrap();
+    let handle = stream.cancel_handle();
+    let (polling_tx, polling_rx) = tokio::sync::oneshot::channel();
+
+    let task = tokio::spawn(async move {
+        let mut stream = stream;
+        let mut next = Box::pin(stream.next());
+        let mut polling_tx = Some(polling_tx);
+
+        let first_poll = futures::future::poll_fn(|cx| match next.as_mut().poll(cx) {
+            Poll::Ready(item) => Poll::Ready(Some(item)),
+            Poll::Pending => {
+                if let Some(tx) = polling_tx.take() {
+                    let _ = tx.send(());
+                }
+                Poll::Ready(None)
+            }
+        })
+        .await;
+
+        if let Some(item) = first_poll {
+            return item;
+        }
+
+        next.await
+    });
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), polling_rx)
+        .await
+        .expect("body stream did not enter pending poll")
+        .expect("pending poll sender dropped");
+
+    handle.cancel();
+
+    let item = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+        .await
+        .expect("body stream did not finish after cancellation")
+        .expect("body task panicked");
+    assert!(matches!(item, Some(Err(Error::Cancelled))));
+
+    let ping = app
+        .client
+        .get(&ping_uri)
+        .send()
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    assert_eq!(ping, Bytes::from_static(b"pong"));
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancellable_body_cancel_after_one_chunk_returns_cancelled() {
+    async fn one_chunk_then_pending() -> impl IntoResponse {
+        let first = futures::stream::once(async {
+            Ok::<Bytes, std::convert::Infallible>(Bytes::from_static(b"first"))
+        });
+        let pending = futures::stream::pending::<Result<Bytes, std::convert::Infallible>>();
+        AxumBody::from_stream(first.chain(pending))
+    }
+
+    async fn ping() -> &'static str {
+        "pong"
+    }
+
+    let app = Router::new()
+        .route("/one-then-pending", get(one_chunk_then_pending))
+        .route("/ping", get(ping));
+    let app = spawn_test_app(app).await;
+
+    let body_uri = format!("iroh+h3://{}/one-then-pending", app.endpoint.id());
+    let ping_uri = format!("iroh+h3://{}/ping", app.endpoint.id());
+    let response = app
+        .client
+        .get(&body_uri)
+        .send_cancellable()
+        .unwrap()
+        .await
+        .unwrap();
+
+    let mut stream = response.cancellable_bytes_stream().unwrap();
+    let handle = stream.cancel_handle();
+    let first = stream
+        .next()
+        .await
+        .expect("first item should exist")
+        .unwrap();
+    assert_eq!(first, Bytes::from_static(b"first"));
+
+    let (polling_tx, polling_rx) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        let mut next = Box::pin(stream.next());
+        let mut polling_tx = Some(polling_tx);
+        futures::future::poll_fn(|cx| match next.as_mut().poll(cx) {
+            Poll::Ready(item) => Poll::Ready(item),
+            Poll::Pending => {
+                if let Some(tx) = polling_tx.take() {
+                    let _ = tx.send(());
+                }
+                Poll::Pending
+            }
+        })
+        .await
+    });
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), polling_rx)
+        .await
+        .expect("body stream did not enter pending poll")
+        .expect("pending poll sender dropped");
+
+    handle.cancel();
+    let item = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+        .await
+        .expect("body stream did not finish after cancellation")
+        .expect("body task panicked");
+    assert!(matches!(item, Some(Err(Error::Cancelled))));
+
+    let ping = app
+        .client
+        .get(&ping_uri)
+        .send()
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    assert_eq!(ping, Bytes::from_static(b"pong"));
+}
+
 #[cfg_attr(not(target_family = "wasm"), tokio::test)]
 #[wasm_bindgen_test]
 async fn headers_pending_cancel_stops_waiting() {

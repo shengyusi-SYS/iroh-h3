@@ -35,9 +35,7 @@ type SendRequestFuture =
 type StreamIoFuture =
     Pin<Box<dyn Future<Output = (H3Sender, H3RequestStream, Result<(), Error>)> + Send>>;
 type RecvResponseFuture = Pin<
-    Box<
-        dyn Future<Output = (H3Sender, H3RequestStream, Result<http::Response<()>, Error>)> + Send,
-    >,
+    Box<dyn Future<Output = (H3Sender, H3RequestStream, Result<http::Response<()>, Error>)> + Send>,
 >;
 
 enum PendingRequestStage {
@@ -581,11 +579,28 @@ impl Stream for CancellableBytesStream {
             return Poll::Ready(None);
         }
 
-        let stream = body
-            .stream
-            .as_mut()
-            .expect("stream owner missing before terminal");
-        match ready!(stream.poll_recv_data(cx)).transpose() {
+        let item = {
+            let stream = body
+                .stream
+                .as_mut()
+                .expect("stream owner missing before terminal");
+            ready!(stream.poll_recv_data(cx)).transpose()
+        };
+
+        if state.is_cancelled() {
+            if let Some(stream) = body.stream.as_mut() {
+                let mut owner = H3StopOwner::new(stream);
+                state.apply_cancel_to_owner(&mut owner);
+            }
+            if state.take_cancel_error_to_emit() {
+                self.body = None;
+                return Poll::Ready(Some(Err(Error::Cancelled)));
+            }
+            self.body = None;
+            return Poll::Ready(None);
+        }
+
+        match item {
             Some(Ok(mut frame)) => {
                 trace!("received a frame of {} bytes", frame.remaining());
                 let bytes = frame.copy_to_bytes(frame.remaining());
