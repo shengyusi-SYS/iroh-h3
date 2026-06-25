@@ -33,7 +33,6 @@ use h3::{
 };
 pub use iroh::endpoint::{AcceptBi, AcceptUni, Endpoint, OpenBi, OpenUni, VarInt};
 use iroh::endpoint::{ConnectionError, ReadError, WriteError};
-use tokio_util::sync::ReusableBoxFuture;
 
 /// BoxStream type alias with `Sync` and `Send` requirements.
 type BoxStreamSync<'a, T> = Pin<Box<dyn Stream<Item = T> + Sync + Send + 'a>>;
@@ -385,28 +384,40 @@ where
 
 /// A receiving QUIC stream that reads ordered chunks of data.
 ///
-/// Internally wraps an [`iroh::endpoint::RecvStream`] and manages
-/// reusable futures for efficient reading.
+/// Internally wraps an [`iroh::endpoint::RecvStream`] and tracks whether it is
+/// idle, actively reading, or terminal.
 pub struct RecvStream {
-    stream: Option<iroh::endpoint::RecvStream>,
-    read_chunk_fut: ReadChunkFuture,
+    recv_id: StreamId,
+    state: RecvStreamState,
 }
 
-/// Type alias for a reusable boxed future that reads the next chunk.
-type ReadChunkFuture = ReusableBoxFuture<
-    'static,
-    (
-        iroh::endpoint::RecvStream,
-        Result<Option<Bytes>, iroh::endpoint::ReadError>,
-    ),
+enum RecvStreamState {
+    Idle(iroh::endpoint::RecvStream),
+    Reading(ReadChunkFuture),
+    Stopped,
+    Drained,
+    Failed,
+}
+
+type ReadChunkFuture = Pin<
+    Box<
+        dyn Future<
+                Output = (
+                    iroh::endpoint::RecvStream,
+                    Result<Option<Bytes>, iroh::endpoint::ReadError>,
+                ),
+            > + Send
+            + 'static,
+    >,
 >;
 
 impl RecvStream {
     /// Creates a new [`RecvStream`] from an [`iroh::endpoint::RecvStream`].
     fn new(stream: iroh::endpoint::RecvStream) -> Self {
+        let num: u64 = stream.id().into();
         Self {
-            stream: Some(stream),
-            read_chunk_fut: ReusableBoxFuture::new(async { unreachable!() }),
+            recv_id: num.try_into().expect("invalid stream id"),
+            state: RecvStreamState::Idle(stream),
         }
     }
 }
@@ -424,31 +435,61 @@ impl quic::RecvStream for RecvStream {
         &mut self,
         cx: &mut task::Context<'_>,
     ) -> Poll<Result<Option<Self::Buf>, StreamErrorIncoming>> {
-        if let Some(mut stream) = self.stream.take() {
-            self.read_chunk_fut.set(async move {
-                let chunk = stream.read_chunk(usize::MAX).await;
-                (stream, chunk)
-            })
-        };
-
-        let (stream, chunk) = ready!(self.read_chunk_fut.poll(cx));
-        self.stream = Some(stream);
-        Poll::Ready(Ok(chunk.map_err(convert_read_error_to_stream_error)?))
+        loop {
+            match &mut self.state {
+                RecvStreamState::Idle(_) => {
+                    let state = std::mem::replace(&mut self.state, RecvStreamState::Stopped);
+                    let RecvStreamState::Idle(mut stream) = state else {
+                        unreachable!("state checked before replacement")
+                    };
+                    self.state = RecvStreamState::Reading(Box::pin(async move {
+                        let chunk = stream.read_chunk(usize::MAX).await;
+                        (stream, chunk)
+                    }));
+                }
+                RecvStreamState::Reading(read_chunk_fut) => {
+                    let (stream, chunk) = ready!(read_chunk_fut.as_mut().poll(cx));
+                    match chunk {
+                        Ok(Some(chunk)) => {
+                            self.state = RecvStreamState::Idle(stream);
+                            return Poll::Ready(Ok(Some(chunk)));
+                        }
+                        Ok(None) => {
+                            self.state = RecvStreamState::Drained;
+                            return Poll::Ready(Ok(None));
+                        }
+                        Err(error) => {
+                            self.state = RecvStreamState::Failed;
+                            return Poll::Ready(Err(convert_read_error_to_stream_error(error)));
+                        }
+                    }
+                }
+                RecvStreamState::Stopped | RecvStreamState::Drained | RecvStreamState::Failed => {
+                    return Poll::Ready(Ok(None));
+                }
+            }
+        }
     }
 
     /// Cancels further reception on this stream with the given error code.
     fn stop_sending(&mut self, error_code: u64) {
-        self.stream
-            .as_mut()
-            .unwrap()
-            .stop(VarInt::from_u64(error_code).expect("invalid error_code"))
-            .ok();
+        let error_code = VarInt::from_u64(error_code).expect("invalid error_code");
+        let state = std::mem::replace(&mut self.state, RecvStreamState::Stopped);
+        self.state = match state {
+            RecvStreamState::Idle(mut stream) => {
+                stream.stop(error_code).ok();
+                RecvStreamState::Stopped
+            }
+            RecvStreamState::Reading(_) => RecvStreamState::Stopped,
+            RecvStreamState::Stopped => RecvStreamState::Stopped,
+            RecvStreamState::Drained => RecvStreamState::Drained,
+            RecvStreamState::Failed => RecvStreamState::Failed,
+        };
     }
 
     /// Returns the QUIC stream ID associated with this receive stream.
     fn recv_id(&self) -> StreamId {
-        let num: u64 = self.stream.as_ref().unwrap().id().into();
-        num.try_into().expect("invalid stream id")
+        self.recv_id
     }
 }
 
@@ -594,5 +635,237 @@ where
             }
             Err(err) => Poll::Ready(Err(convert_write_error_to_stream_error(err))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        panic::{AssertUnwindSafe, catch_unwind},
+        task::{Context, Poll},
+    };
+
+    use futures::{future::poll_fn, task::noop_waker_ref};
+    use h3::quic::RecvStream as H3RecvStream;
+    use iroh::{address_lookup::memory::MemoryLookup, endpoint::presets::Minimal};
+
+    use super::*;
+
+    const TEST_ALPN: &[u8] = b"iroh-h3-adapter-test";
+    const MARKER: &[u8] = b"unlock";
+
+    struct TestRecv {
+        recv: RecvStream,
+        client_send: iroh::endpoint::SendStream,
+        _client_recv: iroh::endpoint::RecvStream,
+        _server_send: iroh::endpoint::SendStream,
+        _client_conn: iroh::endpoint::Connection,
+        _server_conn: iroh::endpoint::Connection,
+        _client_endpoint: Endpoint,
+        _server_endpoint: Endpoint,
+    }
+
+    async fn make_test_recv() -> TestRecv {
+        let address_lookup = MemoryLookup::new();
+        let server_endpoint = Endpoint::builder(Minimal)
+            .alpns(vec![TEST_ALPN.to_vec()])
+            .address_lookup(address_lookup.clone())
+            .bind()
+            .await
+            .expect("bind server endpoint");
+        let client_endpoint = Endpoint::builder(Minimal)
+            .address_lookup(address_lookup.clone())
+            .bind()
+            .await
+            .expect("bind client endpoint");
+        address_lookup.add_endpoint_info(server_endpoint.addr());
+        address_lookup.add_endpoint_info(client_endpoint.addr());
+
+        let accepting_endpoint = server_endpoint.clone();
+        let server_accept = tokio::spawn(async move {
+            accepting_endpoint
+                .accept()
+                .await
+                .expect("server accepts incoming connection")
+                .accept()
+                .expect("server accepts connecting handshake")
+                .await
+                .expect("server accepts established connection")
+        });
+
+        let client_conn = client_endpoint
+            .connect(server_endpoint.id(), TEST_ALPN)
+            .await
+            .expect("client connects to server");
+        let server_conn = server_accept.await.expect("server accept task joins");
+
+        let (mut client_send, client_recv) = client_conn
+            .open_bi()
+            .await
+            .expect("client opens bidirectional stream");
+        client_send
+            .write_all(MARKER)
+            .await
+            .expect("client writes marker");
+
+        let (server_send, server_recv) = server_conn
+            .accept_bi()
+            .await
+            .expect("server accepts bidirectional stream");
+
+        TestRecv {
+            recv: RecvStream::new(server_recv),
+            client_send,
+            _client_recv: client_recv,
+            _server_send: server_send,
+            _client_conn: client_conn,
+            _server_conn: server_conn,
+            _client_endpoint: client_endpoint,
+            _server_endpoint: server_endpoint,
+        }
+    }
+
+    async fn drain_marker(recv: &mut RecvStream) {
+        let marker = poll_fn(|cx| H3RecvStream::poll_data(recv, cx))
+            .await
+            .expect("marker read succeeds")
+            .expect("marker chunk is present");
+        assert_eq!(marker, Bytes::from_static(MARKER));
+    }
+
+    fn poll_once(recv: &mut RecvStream) -> Poll<Result<Option<Bytes>, StreamErrorIncoming>> {
+        let mut cx = Context::from_waker(noop_waker_ref());
+        H3RecvStream::poll_data(recv, &mut cx)
+    }
+
+    async fn enter_reading(recv: &mut RecvStream) {
+        drain_marker(recv).await;
+        assert!(
+            poll_once(recv).is_pending(),
+            "read with no available data should be pending"
+        );
+    }
+
+    fn assert_no_panic(f: impl FnOnce()) {
+        assert!(catch_unwind(AssertUnwindSafe(f)).is_ok());
+    }
+
+    #[tokio::test]
+    async fn reading_recv_id_and_stop_sending_do_not_panic() {
+        let mut test = make_test_recv().await;
+        let recv_id = H3RecvStream::recv_id(&test.recv);
+        enter_reading(&mut test.recv).await;
+
+        assert_no_panic(|| {
+            assert_eq!(H3RecvStream::recv_id(&test.recv), recv_id);
+        });
+        assert_no_panic(|| H3RecvStream::stop_sending(&mut test.recv, 42));
+    }
+
+    #[tokio::test]
+    async fn reading_stop_then_next_poll_returns_none_immediately() {
+        let mut test = make_test_recv().await;
+        enter_reading(&mut test.recv).await;
+
+        H3RecvStream::stop_sending(&mut test.recv, 42);
+
+        assert!(matches!(poll_once(&mut test.recv), Poll::Ready(Ok(None))));
+    }
+
+    #[tokio::test]
+    async fn idle_stop_then_poll_returns_none() {
+        let mut test = make_test_recv().await;
+        let stopped = test.client_send.stopped();
+
+        H3RecvStream::stop_sending(&mut test.recv, 42);
+
+        let stop_code = stopped
+            .await
+            .expect("client observes peer stop")
+            .expect("peer stop has an error code");
+        assert_eq!(stop_code.into_inner(), 42);
+        assert!(matches!(poll_once(&mut test.recv), Poll::Ready(Ok(None))));
+    }
+
+    #[tokio::test]
+    async fn terminal_states_repeated_stop_sending_is_idempotent_for_valid_code() {
+        let mut stopped = make_test_recv().await;
+        H3RecvStream::stop_sending(&mut stopped.recv, 42);
+        assert_no_panic(|| H3RecvStream::stop_sending(&mut stopped.recv, 42));
+        assert!(matches!(
+            poll_once(&mut stopped.recv),
+            Poll::Ready(Ok(None))
+        ));
+
+        let mut drained = make_test_recv().await;
+        drain_marker(&mut drained.recv).await;
+        drained
+            .client_send
+            .finish()
+            .expect("client finishes send stream");
+        let eof = poll_fn(|cx| H3RecvStream::poll_data(&mut drained.recv, cx))
+            .await
+            .expect("eof poll succeeds");
+        assert!(eof.is_none());
+        assert_no_panic(|| H3RecvStream::stop_sending(&mut drained.recv, 42));
+        assert_no_panic(|| H3RecvStream::stop_sending(&mut drained.recv, 42));
+        assert!(matches!(
+            poll_once(&mut drained.recv),
+            Poll::Ready(Ok(None))
+        ));
+
+        let mut failed = make_test_recv().await;
+        drain_marker(&mut failed.recv).await;
+        failed
+            .client_send
+            .reset(VarInt::from_u64(42).expect("valid reset code"))
+            .expect("client resets send stream");
+        let first_error = poll_fn(|cx| H3RecvStream::poll_data(&mut failed.recv, cx))
+            .await
+            .expect_err("first reset poll returns an error");
+        assert!(matches!(
+            first_error,
+            StreamErrorIncoming::StreamTerminated { error_code: 42 }
+        ));
+        assert_no_panic(|| H3RecvStream::stop_sending(&mut failed.recv, 42));
+        assert_no_panic(|| H3RecvStream::stop_sending(&mut failed.recv, 42));
+        assert!(matches!(poll_once(&mut failed.recv), Poll::Ready(Ok(None))));
+    }
+
+    #[tokio::test]
+    async fn eof_then_repeated_poll_returns_none() {
+        let mut test = make_test_recv().await;
+        drain_marker(&mut test.recv).await;
+        test.client_send
+            .finish()
+            .expect("client finishes send stream");
+
+        let eof = poll_fn(|cx| H3RecvStream::poll_data(&mut test.recv, cx))
+            .await
+            .expect("eof poll succeeds");
+        assert!(eof.is_none());
+
+        assert!(matches!(poll_once(&mut test.recv), Poll::Ready(Ok(None))));
+        assert!(matches!(poll_once(&mut test.recv), Poll::Ready(Ok(None))));
+    }
+
+    #[tokio::test]
+    async fn peer_reset_first_error_then_repeated_poll_returns_none() {
+        let mut test = make_test_recv().await;
+        drain_marker(&mut test.recv).await;
+        test.client_send
+            .reset(VarInt::from_u64(42).expect("valid reset code"))
+            .expect("client resets send stream");
+
+        let first_error = poll_fn(|cx| H3RecvStream::poll_data(&mut test.recv, cx))
+            .await
+            .expect_err("first reset poll returns an error");
+        assert!(matches!(
+            first_error,
+            StreamErrorIncoming::StreamTerminated { error_code: 42 }
+        ));
+
+        assert!(matches!(poll_once(&mut test.recv), Poll::Ready(Ok(None))));
+        assert!(matches!(poll_once(&mut test.recv), Poll::Ready(Ok(None))));
     }
 }
