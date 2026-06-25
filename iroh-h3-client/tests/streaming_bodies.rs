@@ -1,4 +1,6 @@
 use std::convert::Infallible;
+use std::future::Future;
+use std::task::Poll;
 
 use axum::{
     Router,
@@ -10,17 +12,51 @@ use bytes::Bytes;
 use futures::StreamExt;
 use http_body::Frame;
 use http_body_util::{StreamBody, combinators::BoxBody};
-#[cfg(not(target_family = "wasm"))]
-use iroh::{address_lookup::memory::MemoryLookup, endpoint::presets::Minimal};
+use iroh::Endpoint;
 #[cfg(target_family = "wasm")]
 use iroh::endpoint::presets::N0;
-use iroh::Endpoint;
+#[cfg(not(target_family = "wasm"))]
+use iroh::{address_lookup::memory::MemoryLookup, endpoint::presets::Minimal};
 use iroh_h3_axum::IrohAxum;
 use iroh_h3_client::IrohH3Client;
 use wasm_bindgen_test::wasm_bindgen_test;
 wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 
 const ALPN: &[u8] = b"iroh+h3";
+
+#[cfg(not(target_family = "wasm"))]
+struct TestApp {
+    endpoint: Endpoint,
+    client: IrohH3Client,
+    _router: iroh::protocol::Router,
+}
+
+#[cfg(not(target_family = "wasm"))]
+async fn spawn_test_app(app: Router) -> TestApp {
+    let address_lookup = MemoryLookup::new();
+    let server_endpoint = Endpoint::builder(Minimal)
+        .address_lookup(address_lookup.clone())
+        .bind()
+        .await
+        .unwrap();
+    let client_endpoint = Endpoint::builder(Minimal)
+        .address_lookup(address_lookup.clone())
+        .bind()
+        .await
+        .unwrap();
+    address_lookup.add_endpoint_info(server_endpoint.addr());
+    address_lookup.add_endpoint_info(client_endpoint.addr());
+
+    let router = iroh::protocol::Router::builder(server_endpoint.clone())
+        .accept(ALPN, IrohAxum::new(app))
+        .spawn();
+
+    TestApp {
+        endpoint: server_endpoint,
+        client: IrohH3Client::new(client_endpoint, ALPN.into()),
+        _router: router,
+    }
+}
 
 /// Streaming responses
 #[cfg_attr(not(target_family = "wasm"), tokio::test)]
@@ -152,4 +188,118 @@ async fn streaming_request_body() {
         count += 1;
     }
     assert_eq!(count, PONG_COUNT);
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn legacy_send_bytes_stream_pending_drop_keeps_connection_reusable() {
+    async fn delayed_body() -> impl IntoResponse {
+        let pending = futures::stream::pending::<Result<Bytes, Infallible>>();
+        Body::from_stream(pending)
+    }
+
+    async fn ping() -> &'static str {
+        "pong"
+    }
+
+    let app = Router::new()
+        .route("/delayed-body", get(delayed_body))
+        .route("/ping", get(ping));
+    let app = spawn_test_app(app).await;
+
+    let body_uri = format!("iroh+h3://{}/delayed-body", app.endpoint.id());
+    let ping_uri = format!("iroh+h3://{}/ping", app.endpoint.id());
+    let response = app.client.get(&body_uri).send().await.unwrap();
+    let mut stream = response.bytes_stream();
+
+    {
+        let mut next = Box::pin(stream.next());
+        let first_poll = futures::future::poll_fn(|cx| match next.as_mut().poll(cx) {
+            Poll::Ready(item) => Poll::Ready(Poll::Ready(item)),
+            Poll::Pending => Poll::Ready(Poll::Pending),
+        })
+        .await;
+        assert!(
+            matches!(first_poll, Poll::Pending),
+            "delayed body stream completed before it could be dropped"
+        );
+    }
+    drop(stream);
+
+    let ping = app
+        .client
+        .get(&ping_uri)
+        .send()
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    assert_eq!(ping, Bytes::from_static(b"pong"));
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn legacy_send_bytes_stream_one_chunk_then_drop_keeps_connection_reusable() {
+    async fn one_chunk_then_pending() -> impl IntoResponse {
+        let first =
+            futures::stream::once(async { Ok::<Bytes, Infallible>(Bytes::from_static(b"first")) });
+        let pending = futures::stream::pending::<Result<Bytes, Infallible>>();
+        Body::from_stream(first.chain(pending))
+    }
+
+    async fn ping() -> &'static str {
+        "pong"
+    }
+
+    let app = Router::new()
+        .route("/one-then-pending", get(one_chunk_then_pending))
+        .route("/ping", get(ping));
+    let app = spawn_test_app(app).await;
+
+    let body_uri = format!("iroh+h3://{}/one-then-pending", app.endpoint.id());
+    let ping_uri = format!("iroh+h3://{}/ping", app.endpoint.id());
+    let response = app.client.get(&body_uri).send().await.unwrap();
+    let mut stream = response.bytes_stream();
+    let first = stream
+        .next()
+        .await
+        .expect("first item should exist")
+        .unwrap();
+    assert_eq!(first, Bytes::from_static(b"first"));
+    drop(stream);
+
+    let ping = app
+        .client
+        .get(&ping_uri)
+        .send()
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    assert_eq!(ping, Bytes::from_static(b"pong"));
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn legacy_send_bytes_complete_read_still_succeeds() {
+    async fn hello() -> &'static str {
+        "hello"
+    }
+
+    let app = Router::new().route("/hello", get(hello));
+    let app = spawn_test_app(app).await;
+
+    let uri = format!("iroh+h3://{}/hello", app.endpoint.id());
+    let body = app
+        .client
+        .get(&uri)
+        .send()
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    assert_eq!(body, Bytes::from_static(b"hello"));
 }
