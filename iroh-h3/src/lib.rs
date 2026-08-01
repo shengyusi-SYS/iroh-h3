@@ -34,6 +34,8 @@ use h3::{
 pub use iroh::endpoint::{AcceptBi, AcceptUni, Endpoint, OpenBi, OpenUni, VarInt};
 use iroh::endpoint::{ConnectionError, ReadError, WriteError};
 
+const MAX_RECV_CHUNK_SIZE: usize = 1024 * 1024;
+
 /// BoxStream type alias with `Sync` and `Send` requirements.
 type BoxStreamSync<'a, T> = Pin<Box<dyn Stream<Item = T> + Sync + Send + 'a>>;
 
@@ -444,7 +446,7 @@ impl quic::RecvStream for RecvStream {
                         unreachable!("state checked before replacement")
                     };
                     self.state = RecvStreamState::Reading(Box::pin(async move {
-                        let chunk = stream.read_chunk(usize::MAX).await;
+                        let chunk = stream.read_chunk(MAX_RECV_CHUNK_SIZE).await;
                         (stream, chunk)
                     }));
                 }
@@ -749,6 +751,49 @@ mod tests {
 
     fn assert_no_panic(f: impl FnOnce()) {
         assert!(catch_unwind(AssertUnwindSafe(f)).is_ok());
+    }
+
+    #[tokio::test]
+    async fn recv_stream_splits_large_writes_at_the_hard_chunk_limit_without_data_loss() {
+        let mut test = make_test_recv().await;
+        drain_marker(&mut test.recv).await;
+
+        let payload_len = MAX_RECV_CHUNK_SIZE * 2 + 17;
+        let payload = (0..payload_len)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let expected = payload.clone();
+        let mut client_send = test.client_send;
+        let writer = tokio::spawn(async move {
+            client_send
+                .write_all(&payload)
+                .await
+                .expect("client writes oversized payload");
+            client_send.finish().expect("client finishes send stream");
+        });
+
+        let mut received = Vec::with_capacity(payload_len);
+        let mut chunk_count = 0;
+        while let Some(chunk) = poll_fn(|cx| H3RecvStream::poll_data(&mut test.recv, cx))
+            .await
+            .expect("payload read succeeds")
+        {
+            assert!(
+                chunk.len() <= MAX_RECV_CHUNK_SIZE,
+                "received chunk of {} bytes exceeds the {} byte hard limit",
+                chunk.len(),
+                MAX_RECV_CHUNK_SIZE
+            );
+            chunk_count += 1;
+            received.extend_from_slice(&chunk);
+        }
+        writer.await.expect("writer task joins");
+
+        assert!(
+            chunk_count >= 3,
+            "oversized payload must span multiple chunks"
+        );
+        assert_eq!(received, expected);
     }
 
     #[tokio::test]
