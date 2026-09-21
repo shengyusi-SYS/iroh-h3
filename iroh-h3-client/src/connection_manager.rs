@@ -1,6 +1,6 @@
 use std::ops::ControlFlow;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use bytes::Buf;
@@ -127,11 +127,15 @@ impl ConnectionManager {
 
     #[instrument(skip(self, peer_id))]
     fn create_connection(&self, peer_id: EndpointId) -> Shared<SenderFuture> {
-        let self_clone = self.clone();
+        // Neither the cached setup future nor its driver may own the cache:
+        // otherwise dropping the last client cannot release the cached sender.
+        let endpoint = self.endpoint.clone();
+        let alpn = self.alpn.clone();
+        let sender_cache = Arc::downgrade(&self.sender_cache);
+        let disconnect_tx = self.disconnect_tx.clone();
         let fut: SenderFuture = Box::pin(async move {
-            let conn = self_clone
-                .endpoint
-                .connect(peer_id, &self_clone.alpn)
+            let conn = endpoint
+                .connect(peer_id, &alpn)
                 .await
                 .map_err(|err| Error::Transport(err.into()))
                 .map_err(Arc::new)?;
@@ -142,7 +146,13 @@ impl ConnectionManager {
                 .map_err(Arc::new)?;
 
             // Cleanup task when connection closes
-            task::spawn(self_clone.run_connection(conn, peer_id));
+            task::spawn(Self::run_connection(
+                conn,
+                peer_id,
+                sender_cache,
+                disconnect_tx,
+                endpoint,
+            ));
 
             Ok(sender)
         });
@@ -150,21 +160,28 @@ impl ConnectionManager {
         fut.shared()
     }
 
-    #[instrument(skip(self, conn))]
+    #[instrument(skip_all)]
     async fn run_connection(
-        self,
         mut conn: Connection<iroh_h3::Connection, Bytes>,
         peer_id: EndpointId,
+        sender_cache: Weak<DashMap<EndpointId, CachedSender>>,
+        disconnect_tx: Option<broadcast::Sender<EndpointId>>,
+        endpoint: Endpoint,
     ) {
         let error = conn.wait_idle().await;
         trace!(
             "Connection with {} closed. Cause: {error}",
             peer_id.fmt_short()
         );
-        self.sender_cache.remove(&peer_id);
-        if let Some(tx) = &self.disconnect_tx {
+        if let Some(cache) = sender_cache.upgrade() {
+            cache.remove(&peer_id);
+        }
+        if let Some(tx) = disconnect_tx {
             let _ = tx.send(peer_id);
         }
+        // QUIC connections do not keep Iroh's endpoint driver alive. Responses
+        // may outlive the client, so retain the endpoint until H3 has closed.
+        drop(endpoint);
     }
 
     /// Sends an HTTP body over the given request stream.
@@ -268,4 +285,41 @@ pub(crate) fn peer_id(uri: &Uri) -> Result<EndpointId, Error> {
     authority
         .parse()
         .map_err(|err| RequestValidationError::BadPeerId(err).into())
+}
+
+#[cfg(all(test, not(target_family = "wasm")))]
+mod lifecycle_tests {
+    use super::*;
+    use iroh::{address_lookup::memory::MemoryLookup, endpoint::presets::Minimal};
+
+    #[tokio::test]
+    async fn cancelled_connection_setup_releases_cache() {
+        let lookup = MemoryLookup::new();
+        // No accept loop: the outgoing connection remains in setup.
+        let server = Endpoint::builder(Minimal)
+            .alpns(vec![b"iroh+h3".to_vec()])
+            .bind()
+            .await
+            .unwrap();
+        lookup.add_endpoint_info(server.addr());
+        let endpoint = Endpoint::builder(Minimal)
+            .address_lookup(lookup)
+            .bind()
+            .await
+            .unwrap();
+        let manager = ConnectionManager::new(endpoint.clone(), b"iroh+h3".to_vec());
+        let cache = Arc::downgrade(&manager.sender_cache);
+        {
+            let setup = manager.get_sender(server.id());
+            futures::pin_mut!(setup);
+            assert!(futures::poll!(setup).is_pending());
+        }
+        drop(manager);
+        assert!(
+            cache.upgrade().is_none(),
+            "cancelled setup retained its own cache"
+        );
+        server.close().await;
+        endpoint.close().await;
+    }
 }
