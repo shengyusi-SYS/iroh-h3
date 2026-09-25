@@ -14,4 +14,9 @@ categories = ["network-programming", "asynchronous", "web-programming"]
 authors = ["Lech Mazur <mazurlech@proton.me>"]
 
 [workspace.dependencies]
-iroh = "1.0.0"
+iroh = "1.2.0"
+
+[patch.crates-io]
+# n0-watcher 1.0.0 predates upstream Waker cleanup fixes #63 and #64.
+# Consumers must repeat this patch in their workspace root until a fixed release exists.
+n0-watcher = { git = "https://github.com/n0-computer/n0-watcher.git", rev = "3b8cd02b29343f901ab3dba9c49c55480c5c9c31" }
