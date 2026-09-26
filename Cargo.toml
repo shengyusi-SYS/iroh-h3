@@ -1,5 +1,6 @@
 [workspace]
 members = ["iroh-h3", "iroh-h3-client", "iroh-h3-axum"]
+exclude = ["vendor/h3"]
 
 resolver = "2"
 

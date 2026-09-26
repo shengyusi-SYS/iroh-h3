@@ -1,0 +1,84 @@
+--- a/src/quic.rs
++++ b/src/quic.rs
+@@ -169,6 +169,18 @@
+ 
+ /// A trait describing the "send" actions of a QUIC stream.
+ pub trait SendStream<B: Buf> {
++    /// Observe peer STOP_SENDING or connection failure without writing data.
++    ///
++    /// `Ok(Some(code))` means peer cancellation; `Ok(None)` means acknowledged
++    /// completion. Only poll before completion. The default has no notification;
++    /// adapters supporting independent cancellation must override it.
++    fn poll_stopped(
++        &mut self,
++        _cx: &mut task::Context<'_>,
++    ) -> Poll<Result<Option<u64>, StreamErrorIncoming>> {
++        Poll::Pending
++    }
++
+     /// Polls if the stream can send more data.
+     fn poll_ready(&mut self, cx: &mut task::Context<'_>) -> Poll<Result<(), StreamErrorIncoming>>;
+ 
+--- a/src/stream.rs
++++ b/src/stream.rs
+@@ -34,6 +34,8 @@
+     D: Into<WriteBuf<B>>,
+     B: Buf,
+ {
++    // hyperium/h3#360: complete the buffered tail of a cancelled write first.
++    future::poll_fn(|cx| stream.poll_ready(cx)).await?;
+     stream.send_data(data)?;
+     future::poll_fn(|cx| stream.poll_ready(cx)).await?;
+ 
+@@ -516,6 +518,13 @@
+     B: Buf,
+     S: SendStream<B>,
+ {
++    fn poll_stopped(
++        &mut self,
++        cx: &mut Context<'_>,
++    ) -> Poll<Result<Option<u64>, StreamErrorIncoming>> {
++        self.stream.poll_stopped(cx)
++    }
++
+     fn poll_finish(
+         &mut self,
+         cx: &mut std::task::Context<'_>,
+--- a/src/frame.rs
++++ b/src/frame.rs
+@@ -159,6 +159,13 @@
+     T: SendStream<B>,
+     B: Buf,
+ {
++    fn poll_stopped(
++        &mut self,
++        cx: &mut Context<'_>,
++    ) -> Poll<Result<Option<u64>, StreamErrorIncoming>> {
++        self.stream.poll_stopped(cx)
++    }
++
+     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), StreamErrorIncoming>> {
+         self.stream.poll_ready(cx)
+     }
+--- a/src/server/stream.rs
++++ b/src/server/stream.rs
+@@ -112,6 +112,19 @@
+     S: quic::SendStream<B>,
+     B: Buf,
+ {
++    /// Observe response cancellation without waiting for response body data.
++    /// Delegates to the transport; adapters without support remain pending.
++    pub fn poll_stopped(
++        &mut self,
++        cx: &mut Context<'_>,
++    ) -> Poll<Result<Option<u64>, StreamError>> {
++        match self.inner.stream.poll_stopped(cx) {
++            Poll::Ready(Err(error)) => Poll::Ready(Err(self.handle_quic_stream_error(error))),
++            Poll::Ready(Ok(code)) => Poll::Ready(Ok(code)),
++            Poll::Pending => Poll::Pending,
++        }
++    }
++
+     /// Send the HTTP/3 response
+     ///
+     /// This should be called before trying to send any data with

@@ -32,7 +32,10 @@ use h3::{
     quic::{self, ConnectionErrorIncoming, StreamErrorIncoming, StreamId, WriteBuf},
 };
 pub use iroh::endpoint::{AcceptBi, AcceptUni, Endpoint, OpenBi, OpenUni, VarInt};
-use iroh::endpoint::{ConnectionError, ReadError, WriteError};
+use iroh::endpoint::{ConnectionError, ReadError, StoppedError, WriteError};
+
+type StoppedFuture =
+    Pin<Box<dyn Future<Output = Result<Option<VarInt>, StoppedError>> + Send + Sync>>;
 
 const MAX_RECV_CHUNK_SIZE: usize = 1024 * 1024;
 
@@ -342,6 +345,13 @@ impl<B> quic::SendStream<B> for BidiStream<B>
 where
     B: Buf,
 {
+    fn poll_stopped(
+        &mut self,
+        cx: &mut task::Context<'_>,
+    ) -> Poll<Result<Option<u64>, StreamErrorIncoming>> {
+        self.send.poll_stopped(cx)
+    }
+
     /// Polls for readiness to send data on the stream.
     fn poll_ready(&mut self, cx: &mut task::Context<'_>) -> Poll<Result<(), StreamErrorIncoming>> {
         self.send.poll_ready(cx)
@@ -536,6 +546,7 @@ fn convert_write_error_to_stream_error(error: WriteError) -> StreamErrorIncoming
 pub struct SendStream<B: Buf> {
     stream: iroh::endpoint::SendStream,
     writing: Option<WriteBuf<B>>,
+    stopped: Option<StoppedFuture>,
 }
 
 impl<B> SendStream<B>
@@ -547,6 +558,7 @@ where
         Self {
             stream,
             writing: None,
+            stopped: None,
         }
     }
 }
@@ -555,6 +567,30 @@ impl<B> quic::SendStream<B> for SendStream<B>
 where
     B: Buf,
 {
+    fn poll_stopped(
+        &mut self,
+        cx: &mut task::Context<'_>,
+    ) -> Poll<Result<Option<u64>, StreamErrorIncoming>> {
+        let stopped = self
+            .stopped
+            .get_or_insert_with(|| Box::pin(self.stream.stopped()));
+        let result = ready!(stopped.as_mut().poll(cx));
+        Poll::Ready(
+            result
+                .map(|code| code.map(VarInt::into_inner))
+                .map_err(|error| match error {
+                    StoppedError::ConnectionLost(error) => {
+                        StreamErrorIncoming::ConnectionErrorIncoming {
+                            connection_error: convert_connection_error(error),
+                        }
+                    }
+                    error @ StoppedError::ZeroRttRejected => {
+                        StreamErrorIncoming::Unknown(Box::new(error))
+                    }
+                }),
+        )
+    }
+
     /// Polls to check if the stream is ready to send more data.
     ///
     /// If data is pending in `self.writing`, it is written until complete.
@@ -572,10 +608,9 @@ where
     }
 
     /// Finishes sending data on this stream and closes it gracefully.
-    fn poll_finish(
-        &mut self,
-        _cx: &mut task::Context<'_>,
-    ) -> Poll<Result<(), StreamErrorIncoming>> {
+    fn poll_finish(&mut self, cx: &mut task::Context<'_>) -> Poll<Result<(), StreamErrorIncoming>> {
+        // hyperium/h3#360: FIN must not discard a pending frame tail.
+        ready!(self.poll_ready(cx))?;
         Poll::Ready(
             self.stream
                 .finish()

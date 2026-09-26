@@ -13,7 +13,7 @@ categories = ["network-programming", "asynchronous", "web-programming"]
 iroh-h3 = { version = "0.3.0", path = "../iroh-h3" }
 bytes = "1.10"
 futures-lite = "2.6"
-h3 = "0.0.8"
+h3 = { version = "0.0.8", path = "../vendor/h3" }
 iroh = { workspace = true }
 tokio = { version = "1.48", features = ["rt"], default-features = false }
 axum = { version = "0.8.6", default-features = false }

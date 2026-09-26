@@ -13,7 +13,7 @@ categories = ["network-programming", "asynchronous"]
 iroh-h3 = { version = "0.3.0", path = "../iroh-h3" }
 bytes = "1.10"
 futures = "0.3.31"
-h3 = "0.0.8"
+h3 = { version = "0.0.8", path = "../vendor/h3" }
 iroh = { workspace = true }
 http = "1.3"
 http-body = "1.0"

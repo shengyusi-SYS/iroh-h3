@@ -18,13 +18,14 @@
 
 use std::{
     error::Error,
+    future::{Future, poll_fn},
     pin::Pin,
     task::{Context, Poll},
 };
 
 use axum::{Router, body::HttpBody, extract::FromRequestParts};
 use bytes::{Buf, Bytes};
-use futures_lite::StreamExt;
+use futures_lite::Stream;
 use h3::server::{self, RequestResolver, RequestStream};
 use http::{Request, Response, StatusCode};
 use http_body::Frame;
@@ -95,8 +96,26 @@ impl IrohAxum {
             let mut request = Request::from_parts(parts, request_body);
             request.extensions_mut().insert(RemoteId(remote_id));
 
-            // Call into the Axum router.
-            let response = router.call(request).await?;
+            // Release the cancelled response sender without cancelling business work.
+            let handler = router.call(request);
+            let mut handler = std::pin::pin!(handler);
+            let response = poll_fn(|cx| {
+                if send.poll_stopped(cx).is_ready() {
+                    return Poll::Ready(None);
+                }
+                handler.as_mut().poll(cx).map(Some)
+            })
+            .await;
+            let response = match response {
+                Some(result) => result?,
+                None => {
+                    send.stop_stream(h3::error::Code::H3_REQUEST_CANCELLED);
+                    drop(send);
+                    // A handler may need to finish bookkeeping after disconnect.
+                    let _ = handler.await;
+                    return Ok(());
+                }
+            };
 
             // Send response headers.
             let (parts, body) = response.into_parts();
@@ -105,8 +124,27 @@ impl IrohAxum {
 
             // Stream response body frames.
             let mut response_stream = body.into_data_stream();
-            while let Some(Ok(chunk)) = response_stream.next().await {
-                send.send_data(chunk).await?;
+            loop {
+                // The handler has completed; the remaining body can be cancelled.
+                let next = poll_fn(|cx| {
+                    if send.poll_stopped(cx).is_ready() {
+                        return Poll::Ready(Err(()));
+                    }
+                    Pin::new(&mut response_stream).poll_next(cx).map(Ok)
+                })
+                .await;
+                match next {
+                    Err(()) => {
+                        send.stop_stream(h3::error::Code::H3_REQUEST_CANCELLED);
+                        return Ok(());
+                    }
+                    Ok(Some(Ok(chunk))) => send.send_data(chunk).await?,
+                    Ok(Some(Err(error))) => {
+                        send.stop_stream(h3::error::Code::H3_INTERNAL_ERROR);
+                        return Err(Box::<dyn Error + Send + Sync>::from(error));
+                    }
+                    Ok(None) => break,
+                }
             }
 
             // Gracefully finish the response.
