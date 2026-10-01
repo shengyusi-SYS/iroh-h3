@@ -1,7 +1,5 @@
-use std::ops::ControlFlow;
 use std::pin::Pin;
 use std::sync::{Arc, Weak};
-use std::time::Duration;
 
 use bytes::Buf;
 use bytes::Bytes;
@@ -17,7 +15,7 @@ use http_body_util::BodyExt;
 use iroh::{Endpoint, EndpointId};
 use iroh_h3::BidiStream;
 use iroh_h3::{Connection as IrohH3Connection, OpenStreams};
-use n0_future::{task, time}; // unifies wasm/tokio task spawning, time, etc.
+use n0_future::task; // unifies wasm/tokio task spawning.
 use tokio::sync::broadcast;
 use tracing::instrument;
 use tracing::trace;
@@ -72,54 +70,34 @@ impl ConnectionManager {
 
     #[instrument(skip(self, peer_id))]
     pub async fn get_sender(&self, peer_id: EndpointId) -> Result<Sender, Error> {
-        // Try cached sender first
-        if let Some(sender) = self.try_get_cached_sender(peer_id).await {
-            return Ok(sender);
-        }
-        self.coordinate_connection_setup(peer_id).await
-    }
-
-    #[instrument(skip(self, peer_id))]
-    async fn try_get_cached_sender(&self, peer_id: EndpointId) -> Option<Sender> {
-        let cached_sender = self.sender_cache.get(&peer_id).as_deref().cloned();
-        if let Some(shared) = cached_sender
-            && let Ok(sender) = shared.await
-        {
-            return Some(sender);
-        }
-        None
-    }
-
-    #[instrument(skip(self, peer_id))]
-    async fn coordinate_connection_setup(&self, peer_id: EndpointId) -> Result<Sender, Error> {
+        let mut may_recover_cached_failure = true;
         loop {
-            let action = {
-                let entry = self.sender_cache.entry(peer_id);
-                if let Entry::Occupied(sender_future) = entry {
-                    ControlFlow::Continue(sender_future.get().clone())
-                } else {
-                    trace!("trying to connect to {}", peer_id.fmt_short());
-                    let future = self.create_connection(peer_id);
-                    entry.insert(future.clone());
-                    ControlFlow::Break(future)
-                }
-            };
-
-            match action {
-                ControlFlow::Continue(shared) => {
-                    if let Ok(sender) = shared.await {
-                        return Ok(sender);
+            // Keep the read-only fast path for established connections. No map
+            // guard is retained while polling the shared setup future.
+            let cached = self.sender_cache.get(&peer_id).as_deref().cloned();
+            let (shared, created) = match cached {
+                Some(shared) => (shared, false),
+                None => match self.sender_cache.entry(peer_id) {
+                    Entry::Occupied(entry) => (entry.get().clone(), false),
+                    Entry::Vacant(entry) => {
+                        (entry.insert(self.create_connection(peer_id)).clone(), true)
                     }
-                    time::sleep(Duration::from_millis(1)).await;
-                }
-                ControlFlow::Break(shared) => {
-                    return match shared.await {
-                        Ok(sender) => Ok(sender),
-                        Err(err) => {
-                            self.sender_cache.remove(&peer_id);
-                            Err(err.into())
-                        }
-                    };
+                },
+            };
+            // Keep an unpolled identity: awaiting Shared consumes its pointer.
+            match shared.clone().await {
+                Ok(sender) => return Ok(sender),
+                Err(error) => {
+                    self.sender_cache
+                        .remove_if(&peer_id, |_, cached| cached.ptr_eq(&shared));
+                    if created || !may_recover_cached_failure {
+                        return Err(error.into());
+                    }
+                    // A waiter may acquire one replacement setup before the
+                    // request is sent. This preserves its body and does not
+                    // replay HTTP. Repeated failures must leave the cache and
+                    // return, rather than spinning until an outer timeout.
+                    may_recover_cached_failure = false;
                 }
             }
         }
@@ -291,6 +269,95 @@ pub(crate) fn peer_id(uri: &Uri) -> Result<EndpointId, Error> {
 mod lifecycle_tests {
     use super::*;
     use iroh::{address_lookup::memory::MemoryLookup, endpoint::presets::Minimal};
+
+    fn pending_setup() -> (tokio::sync::oneshot::Sender<()>, CachedSender) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let future: SenderFuture = Box::pin(async move {
+            rx.await.expect("release setup failure");
+            Err(Arc::new(Error::Other("controlled setup failure".into())))
+        });
+        (tx, future.shared())
+    }
+
+    #[tokio::test]
+    async fn cancelled_waiter_allows_inflight_post_to_reconnect_with_body() {
+        let lookup = MemoryLookup::new();
+        let server = Endpoint::builder(Minimal).bind().await.unwrap();
+        let router = iroh::protocol::Router::builder(server.clone())
+            .accept(
+                b"iroh+h3".to_vec(),
+                iroh_h3_axum::IrohAxum::new(axum::Router::new().route(
+                    "/echo",
+                    axum::routing::post(|body: Bytes| async move { body }),
+                )),
+            )
+            .spawn();
+        lookup.add_endpoint_info(server.addr());
+        let endpoint = Endpoint::builder(Minimal)
+            .address_lookup(lookup)
+            .bind()
+            .await
+            .unwrap();
+        let manager = ConnectionManager::new(endpoint.clone(), b"iroh+h3".to_vec());
+        let peer = server.id();
+        let (release, setup) = pending_setup();
+        manager.sender_cache.insert(peer, setup);
+        {
+            let request = manager.get_sender(peer);
+            futures::pin_mut!(request);
+            assert!(futures::poll!(request.as_mut()).is_pending());
+        }
+        // This POST joins the pending setup before it fails. Recovery must
+        // happen inside this same request, without middleware replaying its body.
+        let request = http::Request::builder()
+            .method(http::Method::POST)
+            .uri(format!("iroh+h3://{peer}/echo"))
+            .body(Body::bytes(Bytes::from_static(b"complete-original-body")))
+            .unwrap();
+        let response = manager.handle(request);
+        futures::pin_mut!(response);
+        assert!(futures::poll!(response.as_mut()).is_pending());
+        release.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let response = response.await.unwrap();
+            assert_eq!(response.status(), http::StatusCode::OK);
+            let body = response.into_body().into_bytes().await.unwrap();
+            assert_eq!(&body[..], b"complete-original-body");
+        })
+        .await
+        .expect("inflight POST must reconnect after failed cached setup");
+        endpoint.close().await;
+        router.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn old_setup_failure_joins_replacement_but_stops_after_second_failure() {
+        let endpoint = Endpoint::builder(Minimal).bind().await.unwrap();
+        let manager = ConnectionManager::new(endpoint.clone(), b"iroh+h3".to_vec());
+        let peer = endpoint.id();
+        let (release, setup) = pending_setup();
+        manager.sender_cache.insert(peer, setup);
+        let request = manager.get_sender(peer);
+        futures::pin_mut!(request);
+        assert!(futures::poll!(request.as_mut()).is_pending());
+        let (replacement_release, replacement) = pending_setup();
+        manager.sender_cache.insert(peer, replacement.clone());
+        release.send(()).unwrap();
+        assert!(futures::poll!(request.as_mut()).is_pending());
+        assert!(
+            manager
+                .sender_cache
+                .get(&peer)
+                .unwrap()
+                .ptr_eq(&replacement)
+        );
+        replacement_release.send(()).unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), request).await;
+        assert!(matches!(result, Ok(Err(Error::Shared(ref error)))
+            if error.to_string() == "controlled setup failure"));
+        assert!(!manager.sender_cache.contains_key(&peer));
+        endpoint.close().await;
+    }
 
     #[tokio::test]
     async fn cancelled_connection_setup_releases_cache() {
